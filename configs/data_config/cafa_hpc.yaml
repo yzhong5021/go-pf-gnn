@@ -30,6 +30,7 @@ go_prior:
     CC: 528
 
 batch_size: 64
+min_length: 10
 train_manifest: null
 val_manifest: null
 test_manifest: null

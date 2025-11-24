@@ -1,78 +1,62 @@
+# @package _global_
 defaults:
-  - override hydra/sweeper: optuna
+  - override /hydra/sweeper: optuna
   - _self_
 
-# optuna hyperparameter ranges + study policy.
+# Optuna hyperparameter ranges + study policy for PF-AGCN.
+hpo:
+  study:
+    name: pf_agcn_dev
+    storage: sqlite:///${system.paths.results_root}/optuna/optuna_dev.db
+    direction: maximize
+    sampler: tpe
+    pruner: median
+    n_trials: 40
+    timeout_minutes: 720
+    timeout_seconds: 43200
+    seed: 2025
 
-study:
-  name: pf_agcn_dev
-  storage: sqlite:///${system.paths.results_root}/optuna/optuna_dev.db
-  direction: maximize
-  sampler: tpe
-  pruner: median
-  n_trials: 60
-  timeout_minutes: 720
-  timeout_seconds: 43200
-  seed: 2025
+  search_space:
+    optimizer.lr:
+      type: float
+      low: 0.00001
+      high: 0.005
+      log: true
+    optimizer.weight_decay:
+      type: float
+      low: 0.000001
+      high: 0.01
+      log: true
+    model.seq_gating.shared_dim:
+      type: categorical
+      choices: [128, 256, 384]
+    model.graph.protein_stacks:
+      type: int
+      low: 2
+      high: 4
+    model.seq_gating.dropout:
+      type: float
+      low: 0.0
+      high: 0.5
+    data_config.batch_size:
+      type: categorical
+      choices: [32, 64, 96]
+    scheduler.name:
+      type: categorical
+      choices: [step]
+    scheduler.gamma:
+      type: float
+      low: 0.85
+      high: 0.98
 
-search_space:
-  optimizer.lr:
-    type: float
-    low: 0.00003
-    high: 0.003
-    log: true
-  optimizer.weight_decay:
-    type: float
-    low: 0.0001
-    high: 0.05
-    log: true
-  training.gradient_clip:
-    type: float
-    low: 0.5
-    high: 5.0
-  model.seq_gating.dropout:
-    type: float
-    low: 0.05
-    high: 0.35
-  model.seq_gating.shared_dim:
-    type: categorical
-    choices: [128, 192, 256, 320]
-  model.seq_final.function_dim:
-    type: categorical
-    choices: [256, 320, 384, 448]
-  model.adaptive_protein.top_p_mass:
-    type: float
-    low: 0.6
-    high: 0.95
-  model.adaptive_protein.steps:
-    type: int
-    low: 2
-    high: 4
-  model.adaptive_function.top_p_mass:
-    type: float
-    low: 0.65
-    high: 0.9
-  model.adaptive_function.steps:
-    type: int
-    low: 1
-    high: 3
-  model.adaptive_function.temperature:
-    type: float
-    low: 1.2
-    high: 2.5
-  scheduler.warmup_epochs:
-    type: int
-    low: 1
-    high: 8
+  constraints:
+    max_parameters: 28000000
+    max_gpu_memory_gb: 16
 
-constraints:
-  max_parameters: 28000000
-  max_gpu_memory_gb: 16
-
-callbacks:
-  prune_patience: 3
-  min_epochs: 6
-  checkpoint_metric: fmax
+  callbacks:
+    prune_patience: 3
+    min_epochs: 6
+    checkpoint_metric: fmax
 
 hydra:
   sweeper:

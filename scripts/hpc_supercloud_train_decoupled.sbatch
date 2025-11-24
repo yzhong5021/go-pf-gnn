@@ -31,10 +31,6 @@ export HYDRA_FULL_ERROR=1
 
 for ASPECT in MF BP CC; do
   echo "=== Starting training for ASPECT=${ASPECT} ==="
-  srun python -u scripts/main.py train \
-    --config-path configs \
-    --config-name hpc_full_config \
-    --aspect "${ASPECT}" \
-    experiment_name=pfagcn_supercloud_1 \
-    run_name=pfagcn_supercloud_test_1_${ASPECT}
+  srun python -u scripts/main.py train --config-path configs --config-name hpc_full_config --aspect "${ASPECT}" \
+    experiment_name=pfagcn_supercloud_1
 done

@@ -58,6 +58,64 @@ def _ensure_logger() -> Any:
     return log
 
 
+def _ensure_finite(
+    tensor: torch.Tensor, *, name: str, path: Optional[Path] = None
+) -> torch.Tensor:
+    """Sanitize non-finite values in a tensor and warn if any are found."""
+
+    if torch.isfinite(tensor).all():
+        return tensor
+    logger = _ensure_logger()
+    location = f" ({path})" if path is not None else ""
+    logger.warning("%s contains non-finite values%s; replacing with zeros.", name, location)
+    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _record_length(record: Mapping[str, Any], manifest_dir: Path) -> Optional[int]:
+    """Best-effort extraction of sequence length from a manifest record."""
+
+    if "lengths" in record:
+        lengths = record["lengths"]
+        if isinstance(lengths, (int, float)):
+            return int(lengths)
+        if isinstance(lengths, (list, tuple)) and lengths:
+            try:
+                return int(lengths[0])
+            except (TypeError, ValueError):
+                return None
+        if isinstance(lengths, (str, Path)):
+            path = Path(lengths)
+            if not path.is_absolute():
+                path = (manifest_dir / path).resolve()
+            try:
+                arr = np.load(path, allow_pickle=False, mmap_mode="r")
+                try:
+                    return int(arr.reshape(-1)[0])
+                finally:
+                    if hasattr(arr, "close"):
+                        arr.close()
+            except Exception:  # noqa: BLE001
+                return None
+
+    emb_path = record.get("embedding_path")
+    if emb_path:
+        path = Path(emb_path)
+        if not path.is_absolute():
+            path = (manifest_dir / path).resolve()
+        suffix = path.suffix.lower()
+        if suffix in {".npy", ".npz"}:
+            try:
+                arr = np.load(path, allow_pickle=False, mmap_mode="r")
+                try:
+                    return int(arr.shape[0])
+                finally:
+                    if hasattr(arr, "close"):
+                        arr.close()
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
 ####### RAW DATA LOADERS #######
 
 def parse_ground_truth_table(path: Path) -> pd.DataFrame:
@@ -379,6 +437,7 @@ def _load_cached_protein_prior(path: Path) -> torch.Tensor:
     else:
         array = archive
     tensor = torch.as_tensor(array, dtype=torch.float32)
+    tensor = _ensure_finite(tensor, name="protein_prior", path=resolved)
     _PROTEIN_PRIOR_CACHE[resolved] = tensor
     return tensor
 
@@ -405,6 +464,7 @@ def _load_cached_go_prior(
     )
     if tensor.ndim != 2:
         raise ValueError(f"GO prior at {path} must be a square matrix.")
+    tensor = _ensure_finite(tensor, name="go_prior", path=resolved)
     _GO_PRIOR_CACHE[cache_key] = tensor
     return tensor
 
@@ -419,9 +479,20 @@ class ManifestDataset(Dataset):
     with optional go_prior_key/go_prior_key_priority hints).
     """
 
-    def __init__(self, manifest_path: Path) -> None:
+    def __init__(self, manifest_path: Path, min_length: Optional[int] = None) -> None:
         self.manifest_path = manifest_path
-        self.records = self._load_manifest(manifest_path)
+        records = self._load_manifest(manifest_path)
+        self.short_drop_count = 0
+        if min_length is not None:
+            filtered: list[Dict[str, Any]] = []
+            for record in records:
+                length_val = _record_length(record, manifest_path.parent)
+                if length_val is not None and length_val < min_length:
+                    self.short_drop_count += 1
+                    continue
+                filtered.append(record)
+            records = filtered
+        self.records = records
         if not self.records:
             raise ValueError(f"Manifest {manifest_path} did not yield any records.")
 
@@ -457,6 +528,21 @@ class ManifestDataset(Dataset):
         if go_prior is not None:
             sample["go_prior"] = go_prior
 
+        seq_len = seq_embeddings.shape[0]
+        lengths_tensor = sample.get("lengths")
+        if lengths_tensor is not None:
+            length_val = int(lengths_tensor.reshape(-1)[0].item())
+            if length_val != seq_len:
+                _ensure_logger().warning(
+                    "Length mismatch for %s: manifest length=%s, embedding len=%s; using embedding length.",
+                    self.manifest_path.name,
+                    length_val,
+                    seq_len,
+                )
+                sample["lengths"] = torch.tensor([seq_len], dtype=torch.long)
+        else:
+            sample["lengths"] = torch.tensor([seq_len], dtype=torch.long)
+
         return sample
 
     def _load_manifest(self, path: Path) -> list[Dict[str, Any]]:
@@ -489,7 +575,7 @@ class ManifestDataset(Dataset):
 
         if tensor.ndim != 2:
             raise ValueError("Embeddings must be 2D (length, feature_dim)")
-        return tensor
+        return _ensure_finite(tensor, name="embeddings", path=emb_path if "emb_path" in locals() else None)
 
     def _load_tensor(
         self,
@@ -568,12 +654,23 @@ class ManifestDataset(Dataset):
 def collate_manifest_batch(
     batch: Sequence[Dict[str, torch.Tensor]],
     protein_prior_cfg: Optional[Mapping[str, Any]] = None,
+    min_length: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pad variable-length sequences and stack optional priors."""
 
     seqs = [item["seq_embeddings"] for item in batch]
-    lengths = torch.tensor([seq.shape[0] for seq in seqs], dtype=torch.long)
+    lengths_list = []
+    for item, seq in zip(batch, seqs):
+        length_val = int(item.get("lengths", torch.tensor([seq.shape[0]]))[0].item())
+        if length_val <= 0:
+            _ensure_logger().warning("Non-positive length detected; using embedding length instead.")
+            length_val = seq.shape[0]
+        if length_val != seq.shape[0]:
+            length_val = min(length_val, seq.shape[0])
+        lengths_list.append(length_val)
+    lengths = torch.tensor(lengths_list, dtype=torch.long)
     padded = pad_sequence(seqs, batch_first=True)
+    lengths = torch.clamp(lengths, min=0, max=padded.size(1))
     mask = torch.arange(padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)
 
     targets = torch.stack([item["targets"] for item in batch])
@@ -624,6 +721,7 @@ def build_manifest_dataloader(
     base_dir: Path,
     shuffle: bool,
     protein_prior_cfg: Optional[Mapping[str, Any]] = None,
+    min_length: Optional[int] = None,
 ) -> Optional[DataLoader]:
     """Create a manifest-backed dataloader if a path is provided."""
 
@@ -632,7 +730,7 @@ def build_manifest_dataloader(
     manifest_path = Path(manifest)
     if not manifest_path.is_absolute():
         manifest_path = (base_dir / manifest_path).resolve()
-    dataset = ManifestDataset(manifest_path)
+    dataset = ManifestDataset(manifest_path, min_length=min_length)
 
     def _collate(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         return collate_manifest_batch(batch, protein_prior_cfg=protein_prior_cfg)

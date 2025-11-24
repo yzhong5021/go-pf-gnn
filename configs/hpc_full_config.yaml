@@ -20,8 +20,8 @@ training:
   default_root_dir: ${hydra:runtime.output_dir}
 
 data_config:
-  num_workers: 16
-  pin_memory: true
+  num_workers: 8
+  pin_memory: false
 
 evaluation:
   metric:

@@ -1,12 +1,14 @@
 #!/bin/bash
 
+# run mkdir -p logs/hpc to get the log info.
+
 #SBATCH -J pfagcn
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=20
 #SBATCH -p mit_normal_gpu
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h200:1
 #SBATCH -t 6:00:00
 #SBATCH -o logs/hpc/pfagcn_%j.log
 #SBATCH -e logs/hpc/pfagcn_%j.err
@@ -27,10 +29,5 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-20}
 export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-20}
 export HYDRA_FULL_ERROR=1
 
-srun python -u scripts/main.py train \
---config-path configs \
---config-name hpc_full_config \
---aspect BP \
-experiment_name=pfagcn_supercloud_test \
-run_name=pfagcn_supercloud_test_alternating_${ASPECT} \ 
-model.graph.structure=alternating
+srun python -u scripts/main.py train --config-path configs  --config-name hpc_full_config --aspect bp \
+    experiment_name=pfagcn_supercloud_1

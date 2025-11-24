@@ -24,7 +24,7 @@ from sklearn.metrics import auc, average_precision_score, precision_recall_curve
 import torch
 from torch import nn
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, StepLR
 
 from lightning.pytorch import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
@@ -142,16 +142,35 @@ def build_optimizer(cfg: DictConfig, parameters: Iterable[nn.Parameter]) -> Opti
 def build_scheduler(cfg: DictConfig, optimizer: Optimizer) -> Optional[LambdaLR]:
     """Configure learning-rate scheduling with optional warmup."""
 
-    sched_cfg = cfg.scheduler
-    name = str(sched_cfg.name).lower()
-    if name == "none":
-        return None
-    if name != "cosine":
-        raise ValueError(f"Unsupported scheduler: {sched_cfg.name}")
+    sched_cfg = cfg.get("scheduler") if hasattr(cfg, "get") else getattr(cfg, "scheduler", {})
+    sched_cfg = sched_cfg or {}
+    getter = getattr(sched_cfg, "get", None)
 
+    def sched_value(key: str, default: Any) -> Any:
+        if callable(getter):
+            try:
+                return getter(key, default)
+            except Exception:
+                return default
+        return getattr(sched_cfg, key, default)
+
+    name_val = sched_value("name", "none")
+    name = str(name_val or "none").lower()
+    if name in {"none", "null"}:
+        return None
     total_epochs = int(cfg.training.max_epochs)
-    warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
-    min_lr = float(sched_cfg.get("min_lr", 0.0))
+
+    if name == "step":
+        gamma = float(sched_value("gamma", 0.95))
+        step_size_default = max(1, total_epochs // 3)
+        step_size = int(sched_value("step_size", step_size_default))
+        return StepLR(optimizer, step_size=step_size, gamma=gamma)
+
+    if name != "cosine":
+        raise ValueError(f"Unsupported scheduler: {name_val}")
+
+    warmup_epochs = int(sched_value("warmup_epochs", 0))
+    min_lr = float(sched_value("min_lr", 0.0))
     base_lrs = [group["lr"] for group in optimizer.param_groups]
 
     def make_lambda(base_lr: float):
@@ -184,6 +203,12 @@ def compute_cafa_metrics(
 ) -> Dict[str, float]:
     """Compute CAFA metrics via cafaeval utilities."""
 
+    def _nan_safe_array(name: str, arr: np.ndarray) -> np.ndarray:
+        if np.isfinite(arr).all():
+            return arr
+        log.warning("%s contains non-finite values; replacing with zeros.", name)
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     if probabilities.size == 0 or targets.size == 0:
         return {
             "fmax": 0.0,
@@ -196,6 +221,9 @@ def compute_cafa_metrics(
             "ia_recall": 0.0,
             "ia_threshold": thresholds[0] if thresholds else 0.5,
         }
+
+    probabilities = _nan_safe_array("probabilities", probabilities.astype(np.float32, copy=False))
+    targets = _nan_safe_array("targets", targets.astype(np.float32, copy=False))
 
     tau_arr = np.asarray(list(thresholds) if thresholds else [0.5], dtype=np.float32)
     ids = {str(idx): idx for idx in range(probabilities.shape[0])}
@@ -371,8 +399,9 @@ class PFAGCNLightningModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:  # noqa: ARG002
         logits = self.forward(batch)
-        loss = self.criterion(logits, batch["targets"])
-        batch_size = batch["targets"].size(0)
+        logits, targets = self._sanitize_logits_and_targets(logits, batch["targets"], stage="train")
+        loss = self.criterion(logits, targets)
+        batch_size = targets.size(0)
         self.log(
             "train/loss_step",
             loss,
@@ -403,17 +432,25 @@ class PFAGCNLightningModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> None:  # noqa: ARG002
         logits = self.forward(batch)
-        loss = self.criterion(logits, batch["targets"])
+        logits, targets = self._sanitize_logits_and_targets(logits, batch["targets"], stage="val")
+        loss = self.criterion(logits, targets)
         probabilities = torch.sigmoid(logits)
+        if not torch.isfinite(probabilities).all():
+            log.warning("Non-finite probabilities detected during validation; sanitizing outputs.")
+            probabilities = torch.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
         if self._val_store is None:
             self._val_store = _ValidationArrayStore(self.model.num_functions)
-        self._val_store.append(probabilities, batch["targets"])
+        self._val_store.append(probabilities, targets)
         self._val_losses.append(float(loss.detach().cpu().item()))
 
     def on_validation_epoch_end(self) -> None:
         if self._val_store is None:
             return
         probs_np, targets_np = self._val_store.materialize()
+        if not (np.isfinite(probs_np).all() and np.isfinite(targets_np).all()):
+            log.warning("Validation store contains non-finite values; sanitizing before metrics.")
+            probs_np = np.nan_to_num(probs_np, nan=0.0, posinf=0.0, neginf=0.0)
+            targets_np = np.nan_to_num(targets_np, nan=0.0, posinf=0.0, neginf=0.0)
         metrics = compute_cafa_metrics(
             probabilities=probs_np,
             targets=targets_np,
@@ -503,6 +540,19 @@ class PFAGCNLightningModule(LightningModule):
     @property
     def _sync_dist(self) -> bool:
         return bool(self.trainer and self.trainer.num_devices > 1)
+
+    def _sanitize_logits_and_targets(
+        self, logits: torch.Tensor, targets: torch.Tensor, *, stage: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Clamp non-finite logits/targets to safe values to avoid metric explosions."""
+
+        if not torch.isfinite(logits).all():
+            log.warning("Non-finite logits detected during %s; replacing with zeros.", stage)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(targets).all():
+            log.warning("Non-finite targets detected during %s; replacing with zeros.", stage)
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+        return logits, targets
 
 
 # ---------------------------------------------------------------------------
@@ -607,13 +657,25 @@ def _prepare_mlflow_logger(cfg: DictConfig, base_dir: Path) -> MLFlowLogger:
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
     logger.log_hyperparams(flatten_config(resolved_cfg))
     logger.experiment.log_dict(logger.run_id, resolved_cfg, artifact_file="hydra_config.json")
+
+    log.info(                                                                                                                                                                                                          
+          "MLflow run initialised: experiment=%s run=%s (tracking_uri=%s)",                                                                                                                                              
+          experiment_name,                                                                                                                                                                                               
+          logger.run_id,                                                                                                                                                                                                 
+          tracking_uri,                                                                                                                                                                                                  
+      )
+
     return logger
 
 
 def _precision_arg(cfg: DictConfig) -> Any:
     precision_cfg = int(cfg.training.get("precision", 32))
     if precision_cfg == 16:
-        return "16-mixed"
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return "bf16-mixed"
+        if torch.cuda.is_available():
+            return "16-mixed"
+        return 32
     return precision_cfg
 
 
@@ -630,8 +692,12 @@ def _configure_tensor_core_precision() -> None:
 ###### Hydra main ######
 
 
-def run_training(cfg: DictConfig) -> None:
-    """Execute PF-AGCN training with a pre-resolved Hydra config."""
+def run_training(cfg: DictConfig) -> float:
+    """Execute PF-AGCN training with a pre-resolved Hydra config.
+
+    Returns:
+        Best IA F-max achieved during validation (float) for Optuna sweeps.
+    """
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     apply_system_env(cfg)
@@ -642,12 +708,16 @@ def run_training(cfg: DictConfig) -> None:
         getattr(cfg.model, "prot_prior", {}), resolve=True
     )
 
+    min_length_cfg = cfg.data_config.get("min_length", 10)
+    min_length = int(min_length_cfg) if min_length_cfg is not None else None
+
     train_loader = build_manifest_dataloader(
         cfg.data_config.get("train_manifest"),
         cfg.data_config,
         base_dir,
         shuffle=True,
         protein_prior_cfg=prot_prior_cfg,
+        min_length=min_length,
     )
     if train_loader is None:
         raise RuntimeError("Training manifest is required to start training.")
@@ -657,8 +727,8 @@ def run_training(cfg: DictConfig) -> None:
         base_dir,
         shuffle=False,
         protein_prior_cfg=prot_prior_cfg,
+        min_length=None,
     )
-
 
     thresholds = list(cfg.evaluation.get("threshold_grid", [0.5]))
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -669,9 +739,20 @@ def run_training(cfg: DictConfig) -> None:
         thresholds=thresholds,
         ia_weights=ia_weights,
     )
+
+    train_dataset = getattr(train_loader, "dataset", None)
+    if train_dataset is not None and hasattr(train_dataset, "short_drop_count"):
+        dropped = int(getattr(train_dataset, "short_drop_count", 0))
+        min_len_log = min_length if min_length is not None else 0
+        log.info(
+            "Filtered %d training samples shorter than %d amino acids (min_length).",
+            dropped,
+            min_len_log,
+        )
     
     mlflow_logger = _prepare_mlflow_logger(cfg, base_dir)
 
+    model_saver = MLflowModelSaver()
     callbacks = [
         ModelCheckpoint(
             monitor="cafa/ia_fmax",
@@ -681,7 +762,7 @@ def run_training(cfg: DictConfig) -> None:
             auto_insert_metric_name=False,
         ),
         LearningRateMonitor(logging_interval="epoch"),
-        MLflowModelSaver(),
+        model_saver,
     ]
 
     trainer_kwargs: Dict[str, Any] = {
@@ -712,13 +793,26 @@ def run_training(cfg: DictConfig) -> None:
             trainer_kwargs[trainer_key] = cfg.training[cfg_key]
 
     trainer = Trainer(**trainer_kwargs)
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    try:                                                                                                                                                                                                                   
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)                                                                                                                                     
+    except Exception:                                                                                                                                                                                                      
+        model_saver.on_train_end(trainer, model)                                                                                                                                                                    
+        raise
+
+    best_metric = float(model.best_ia_fmax)
+    callback_metric = trainer.callback_metrics.get("cafa/ia_fmax") if trainer.callback_metrics else None
+    if not np.isfinite(best_metric) and callback_metric is not None:
+        best_metric = float(callback_metric)
+    if not np.isfinite(best_metric):
+        best_metric = 0.0
+    log.info("Best IA F-max achieved: %.4f", best_metric)
+    return best_metric
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="default_config")
-def main(cfg: DictConfig) -> None:
+def main(cfg: DictConfig) -> float:
     """Hydra entry point when invoking `python -m src.train.training`."""
-    run_training(cfg)
+    return run_training(cfg)
 
 
 if __name__ == "__main__":
