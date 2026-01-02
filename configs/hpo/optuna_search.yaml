@@ -1,77 +1,52 @@
 # @package _global_
 defaults:
-  - override /hydra/sweeper: optuna
   - _self_
 
-# Optuna hyperparameter ranges + study policy for PF-AGCN.
 hpo:
   study:
-    name: pf_agcn_dev
-    storage: sqlite:///${system.paths.results_root}/optuna/optuna_dev.db
+    name: decoupled_sweep_${aspect}_${now:%Y%m%d_%H%M%S}
+    storage: null            # or sqlite:///${hydra:runtime.output_dir}/optuna.db
     direction: maximize
-    sampler: tpe
-    pruner: median
-    n_trials: 40
     timeout_minutes: 720
     timeout_seconds: 43200
     seed: 2025
-
   search_space:
-    optimizer.lr:
+    - name: optimizer.lr
       type: float
-      low: 0.00001
-      high: 0.005
+      low: 1e-5
+      high: 5e-3
       log: true
-    optimizer.weight_decay:
+    - name: optimizer.weight_decay
       type: float
-      low: 0.000001
-      high: 0.01
+      low: 1e-6
+      high: 1e-2
       log: true
-    model.seq_gating.shared_dim:
+    - name: model.seq_gating.shared_dim
       type: categorical
-      choices: [128, 256, 384]
-    model.graph.protein_stacks:
+      choices:
+        - 128
+        - 256
+        - 384
+    - name: model.graph.protein_stacks
       type: int
       low: 2
       high: 4
-    model.seq_gating.dropout:
+      step: 1
+    - name: model.seq_gating.dropout
       type: float
       low: 0.0
       high: 0.5
-    data_config.batch_size:
+    - name: data_config.neighbors.batch_size
       type: categorical
-      choices: [32, 64, 96]
-    scheduler.name:
+      choices:
+        - 32
+        - 64
+        - 96
+    - name: scheduler.name
       type: categorical
-      choices: [step]
-    scheduler.gamma:
+      choices:
+        - step
+    - name: scheduler.gamma
       type: float
       low: 0.85
       high: 0.98
-
-  constraints:
-    max_parameters: 28000000
-    max_gpu_memory_gb: 16
-
-  callbacks:
-    prune_patience: 3
-    min_epochs: 6
-    checkpoint_metric: fmax
-
-hydra:
-  sweeper:
-    study_name: ${hpo.study.name}
-    storage: ${hpo.study.storage}
-    direction: ${hpo.study.direction}
-    n_trials: ${hpo.study.n_trials}
-    timeout: ${hpo.study.timeout_seconds}
-    sampler:
-      _target_: optuna.samplers.TPESampler
-      seed: ${hpo.study.seed}
-      multivariate: true
-      group: true
-    pruner:
-      _target_: optuna.pruners.MedianPruner
-      n_startup_trials: ${hpo.callbacks.min_epochs}
-      n_warmup_steps: ${hpo.callbacks.prune_patience}
-    params: ${hpo.search_space}

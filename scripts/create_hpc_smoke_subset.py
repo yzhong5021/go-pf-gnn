@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=Path("/orcd/home/002/lerchen/code/cafa6"),
+        default=Path("/orcd/home/002/lerchen/code/cafa_proj/cafa6"),
         help="Directory containing the CAFA training data.",
     )
     parser.add_argument(

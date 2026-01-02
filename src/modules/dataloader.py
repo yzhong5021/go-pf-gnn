@@ -10,18 +10,20 @@ tensors via manifests.
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import MutableMapping
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 log = None
-_PROTEIN_PRIOR_CACHE: Dict[Path, torch.Tensor] = {}
-_GO_PRIOR_CACHE: Dict[Tuple[Path, Optional[str], Optional[Tuple[str, ...]]], torch.Tensor] = {}
 _DEFAULT_NPZ_KEY_PRIORITY: Tuple[str, ...] = (
     "embeddings",
     "adjacency",
@@ -56,6 +58,17 @@ def _ensure_logger() -> Any:
 
         log = logging.getLogger(__name__)
     return log
+
+
+def _log_cuda_memory(label: str) -> None:  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    logger = _ensure_logger()  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    if not torch.cuda.is_available():  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        return  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    mem_mb = torch.cuda.memory_allocated() / 1e6  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    logger.info(  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        "CUDA memory %s at %s: %.2f MB", label, timestamp, mem_mb  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+    )
 
 
 def _ensure_finite(
@@ -422,10 +435,6 @@ def _load_cached_protein_prior(path: Path) -> torch.Tensor:
     """Load and cache a protein prior adjacency matrix."""
 
     resolved = path.resolve()
-    cached = _PROTEIN_PRIOR_CACHE.get(resolved)
-    if cached is not None:
-        return cached
-
     archive = np.load(resolved, allow_pickle=False)
     if isinstance(archive, np.lib.npyio.NpzFile):
         if "adjacency" not in archive.files:
@@ -438,7 +447,6 @@ def _load_cached_protein_prior(path: Path) -> torch.Tensor:
         array = archive
     tensor = torch.as_tensor(array, dtype=torch.float32)
     tensor = _ensure_finite(tensor, name="protein_prior", path=resolved)
-    _PROTEIN_PRIOR_CACHE[resolved] = tensor
     return tensor
 
 
@@ -452,10 +460,6 @@ def _load_cached_go_prior(
 
     resolved = path.resolve()
     priority_tuple = tuple(key_priority) if key_priority else None
-    cache_key = (resolved, key, priority_tuple)
-    cached = _GO_PRIOR_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
     tensor = load_npz_tensor(
         resolved,
         key=key,
@@ -465,8 +469,376 @@ def _load_cached_go_prior(
     if tensor.ndim != 2:
         raise ValueError(f"GO prior at {path} must be a square matrix.")
     tensor = _ensure_finite(tensor, name="go_prior", path=resolved)
-    _GO_PRIOR_CACHE[cache_key] = tensor
     return tensor
+
+
+def _save_neighbor_npz(path: Path, neighbors: torch.Tensor, weights: torch.Tensor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        neighbors=neighbors.cpu().numpy(),
+        weights=weights.cpu().numpy(),
+    )
+
+
+def _load_neighbor_npz(path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    archive = np.load(path, allow_pickle=False)
+    try:
+        neighbors = torch.as_tensor(archive["neighbors"], dtype=torch.long)
+        weights = torch.as_tensor(archive["weights"], dtype=torch.float16)
+    finally:
+        if hasattr(archive, "close"):
+            archive.close()
+    if neighbors.ndim != 2 or weights.shape != neighbors.shape:
+        raise ValueError(f"Neighbor archive at {path} must contain matching 2D arrays.")
+    return neighbors, weights
+
+
+def _streaming_topk_similarities(
+    normed: torch.Tensor,
+    top_k: int,
+    chunk_size: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-row top-k cosine sims without materialising full matrix."""
+
+    if normed.ndim != 2:
+        raise ValueError("normed embeddings must be 2D (N, D)")
+    n, _ = normed.shape
+    if n == 0:
+        raise ValueError("Cannot build neighbor graph with zero proteins.")
+    if n == 1:
+        neighbors = torch.full((1, 0), -1, dtype=torch.long)
+        weights = torch.empty((1, 0), dtype=torch.float16)
+        return neighbors, weights
+
+    effective_k = min(max(1, top_k), max(1, n - 1))
+    neighbors = torch.full((n, effective_k), -1, dtype=torch.long)
+    weights = torch.zeros((n, effective_k), dtype=torch.float16)
+
+    chunk = max(1, chunk_size)
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        block = normed[start:end]
+        sims = torch.matmul(block, normed.T)
+        row_idx = torch.arange(end - start)
+        diag_idx = start + row_idx
+        sims[row_idx, diag_idx] = -1e9
+        vals, inds = torch.topk(sims, k=effective_k, dim=1)
+        neighbors[start:end] = inds.cpu()
+        weights[start:end] = vals.to(dtype=torch.float16).cpu()
+
+    return neighbors, weights
+
+
+def _resolve_neighbors_cfg(data_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize neighbour-sampling settings from the data config."""
+
+    neighbors_cfg = data_cfg.get("neighbors", {}) if isinstance(data_cfg, Mapping) else {}
+    if not isinstance(neighbors_cfg, Mapping):
+        neighbors_cfg = {}
+
+    defaults = {
+        "batch_size": 64,
+        "top_k": 20,
+        "cosine_cutoff": 0.3,
+        "max_fanout_1": 20,
+        "max_fanout_2": 10,
+        "global_path": None,
+        "global_train_path": None,
+        "global_val_path": None,
+        "global_test_path": None,
+    }
+    cutoff_value = neighbors_cfg.get("cosine_cutoff", defaults["cosine_cutoff"])
+    if cutoff_value is None:
+        cutoff_value = defaults["cosine_cutoff"]
+    resolved: Dict[str, Any] = {
+        "batch_size": int(neighbors_cfg.get("batch_size", defaults["batch_size"])),
+        "top_k": int(neighbors_cfg.get("top_k", defaults["top_k"])),
+        "cosine_cutoff": float(cutoff_value),
+        "max_fanout_1": int(neighbors_cfg.get("max_fanout_1", defaults["max_fanout_1"])),
+        "max_fanout_2": int(neighbors_cfg.get("max_fanout_2", defaults["max_fanout_2"])),
+        "global_path": neighbors_cfg.get("global_path", defaults["global_path"]),
+        "global_train_path": neighbors_cfg.get(
+            "global_train_path", defaults["global_train_path"]
+        ),
+        "global_val_path": neighbors_cfg.get(
+            "global_val_path", defaults["global_val_path"]
+        ),
+        "global_test_path": neighbors_cfg.get(
+            "global_test_path", defaults["global_test_path"]
+        ),
+    }
+    if "max_fanout_1" not in neighbors_cfg and "fanout_1" in neighbors_cfg:
+        resolved["max_fanout_1"] = int(neighbors_cfg["fanout_1"])
+    if "max_fanout_2" not in neighbors_cfg and "fanout_2" in neighbors_cfg:
+        resolved["max_fanout_2"] = int(neighbors_cfg["fanout_2"])
+
+    legacy_batch = data_cfg.get("batch_size") if isinstance(data_cfg, Mapping) else None
+    if legacy_batch is not None and "batch_size" not in neighbors_cfg:
+        resolved["batch_size"] = int(legacy_batch)
+        _ensure_logger().warning(
+            "data_config.batch_size is deprecated; use data_config.neighbors.batch_size instead."
+        )
+
+    if resolved["cosine_cutoff"] < 0.0 or resolved["cosine_cutoff"] > 1.0:
+        raise ValueError("neighbors.cosine_cutoff must be between 0 and 1.")
+    if resolved["top_k"] < resolved["max_fanout_1"]:
+        raise ValueError("neighbors.top_k must be >= neighbors.max_fanout_1")
+    if resolved["top_k"] < resolved["max_fanout_2"]:
+        raise ValueError("neighbors.top_k must be >= neighbors.max_fanout_2")
+
+    return resolved
+
+
+class ProteinNeighborGraph:
+    """Memory-efficient adjacency built from pooled ESM embeddings."""
+
+    def __init__(
+        self,
+        neighbors: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        if neighbors.shape != weights.shape:
+            raise ValueError("neighbors and weights must have the same shape.")
+        self.neighbors = neighbors.to(dtype=torch.long, device="cpu")
+        self.weights = weights.to(dtype=torch.float16, device="cpu")
+        self.valid = (self.neighbors >= 0) & torch.isfinite(self.weights)
+        self.num_nodes = self.neighbors.size(0)
+
+    @classmethod
+    def from_embeddings(
+        cls,
+        pooled_embeddings: torch.Tensor,
+        top_k: int,
+        *,
+        chunk_size: int = 256,
+    ) -> "ProteinNeighborGraph":
+        if pooled_embeddings.ndim != 2:
+            raise ValueError("pooled_embeddings must be 2D (N, D)")
+        with torch.no_grad():
+            pooled = pooled_embeddings.to(dtype=torch.float32, device="cpu")
+            pooled = torch.nan_to_num(pooled, nan=0.0, posinf=0.0, neginf=0.0)
+            normed = F.normalize(pooled, dim=1)
+            normed = torch.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0)
+            neighbors, weights = _streaming_topk_similarities(normed, top_k, chunk_size=chunk_size)
+            weights = torch.clamp(weights, min=0.0)
+            return cls(neighbors, weights)
+
+    @classmethod
+    def from_npz(cls, path: Path) -> "ProteinNeighborGraph":
+        neighbors, weights = _load_neighbor_npz(path)
+        return cls(neighbors, weights)
+
+    def save(self, path: Path) -> None:
+        _save_neighbor_npz(path, self.neighbors, self.weights)
+
+    def sample_neighbors(
+        self, roots: Sequence[int], max_fanout: int, cosine_cutoff: float
+    ) -> list[int]:
+        neighbors: list[int] = []
+        if max_fanout <= 0:
+            return neighbors
+        _log_cuda_memory("sample_neighbors:start")
+        cutoff = float(cosine_cutoff)
+        for root in roots:
+            if root < 0 or root >= self.num_nodes:
+                continue
+            idx_tensor = self.neighbors[root]
+            weight_tensor = self.weights[root]
+            mask = self.valid[root] & (weight_tensor >= cutoff) & (idx_tensor != root)
+            idx_tensor = idx_tensor[mask]
+            weight_tensor = weight_tensor[mask].to(dtype=torch.float32)
+            if idx_tensor.numel() == 0:
+                continue
+            if idx_tensor.numel() > max_fanout:
+                _, selected = torch.topk(weight_tensor, k=max_fanout, largest=True)
+                idx_tensor = idx_tensor[selected]
+            for candidate in idx_tensor.tolist():
+                candidate = int(candidate)
+                if candidate not in neighbors:
+                    neighbors.append(candidate)
+        _log_cuda_memory("sample_neighbors:done")
+        return neighbors
+
+    def subgraph_adjacency(self, nodes: Sequence[int]) -> torch.Tensor:
+        node_map = {node: idx for idx, node in enumerate(nodes)}
+        size = len(nodes)
+        adjacency = torch.zeros((size, size), dtype=torch.float32)
+        _log_cuda_memory("subgraph_adjacency:start")
+
+        for local_idx, global_idx in enumerate(nodes):
+            if global_idx < 0 or global_idx >= self.num_nodes:
+                continue
+            neighbors = self.neighbors[global_idx]
+            weights = self.weights[global_idx]
+            mask = self.valid[global_idx]
+            if mask.any():
+                neighbors = neighbors[mask]
+                weights = weights[mask]
+            for neighbor, weight in zip(neighbors.tolist(), weights.tolist()):
+                target = node_map.get(int(neighbor))
+                if target is None:
+                    continue
+                value = float(weight)
+                adjacency[local_idx, target] = max(adjacency[local_idx, target].item(), value)
+                adjacency[target, local_idx] = max(adjacency[target, local_idx].item(), value)
+
+        if size > 0:
+            adjacency.fill_diagonal_(1.0)
+        _log_cuda_memory("subgraph_adjacency:done")
+        return adjacency
+
+
+class NeighborSubgraphCollator:
+    """Collate manifest samples into neighbour-sampled protein subgraphs."""
+
+    def __init__(
+        self,
+        dataset: "ManifestDataset",
+        neighbors_cfg: Mapping[str, Any],
+        protein_prior_cfg: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.dataset = dataset
+        self.protein_prior_cfg = protein_prior_cfg or {}
+        self.root_batch_size = int(neighbors_cfg.get("batch_size", 64))
+        self.top_k = int(neighbors_cfg.get("top_k", 20))
+        self.cosine_cutoff = float(neighbors_cfg.get("cosine_cutoff", 0.3))
+        self.max_fanout_1 = int(neighbors_cfg.get("max_fanout_1", 20))
+        self.max_fanout_2 = int(neighbors_cfg.get("max_fanout_2", 10))
+        self.global_path = neighbors_cfg.get("global_path")
+        if self.top_k < self.max_fanout_1:
+            raise ValueError("neighbors.top_k must be >= neighbors.max_fanout_1")
+        if self.top_k < self.max_fanout_2:
+            raise ValueError("neighbors.top_k must be >= neighbors.max_fanout_2")
+
+        logger = _ensure_logger()
+        logger.info(
+            "Preparing global protein neighbor graph with top_k=%d over %d proteins",
+            self.top_k,
+            len(self.dataset),
+        )
+        self.graph = self._prepare_graph(logger)
+        self._generator = torch.Generator().manual_seed(torch.initial_seed())
+
+    def _pool_embeddings(self) -> torch.Tensor:
+        _log_cuda_memory("pool_embeddings:start")
+        pooled: list[torch.Tensor] = []
+        for record in self.dataset.records:
+            emb = self.dataset._load_embedding(record)
+            pooled.append(_ensure_finite(emb, name="embeddings").mean(dim=0))
+        stacked = torch.stack(pooled, dim=0)
+        _log_cuda_memory("pool_embeddings:stacked")
+        return stacked
+
+    def _prepare_graph(self, logger: Any) -> ProteinNeighborGraph:
+        path: Optional[Path] = None
+        if self.global_path:
+            path = Path(self.global_path)
+            if not path.is_absolute():
+                path = (self.dataset.manifest_path.parent / path).resolve()
+        else:
+              stem = self.dataset.manifest_path.stem
+              stem = re.sub(r"^(mf|bp|cc)[_-]", "", stem, flags=re.IGNORECASE)
+              stem = re.sub(r"[_-](mf|bp|cc)$", "", stem, flags=re.IGNORECASE)
+              path = self.dataset.manifest_path.parent / f"{stem}_neighbors_top{self.top_k}.npz"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Neighbor cache not found at {path}; provide a precomputed neighbors npz via "
+                "data_config.neighbors.global_*_path."
+            )
+
+        logger.info("Loading cached protein neighbors from %s", path)
+        neighbors_graph = ProteinNeighborGraph.from_npz(path)
+        self.global_path = str(path)
+        return neighbors_graph
+
+    def __call__(self, batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        if not batch:
+            return {}
+        _log_cuda_memory("subgraph_collate:start")
+        root_indices = [int(item.get("node_index", torch.tensor(0)).item()) for item in batch]
+        root_lookup = {int(item.get("node_index", torch.tensor(0)).item()): item for item in batch}
+        root_set = set(root_indices)
+
+        hop1_counts: list[int] = []
+        hop2_counts: list[int] = []
+        first_hop_all: list[int] = []
+        second_hop_all: list[int] = []
+        seeds_with_zero_second = 0
+
+        for root in root_indices:
+            first = self.graph.sample_neighbors(
+                [root], self.max_fanout_1, self.cosine_cutoff
+            )
+            hop1_counts.append(len(first))
+            first_hop_all.extend(first)
+            second = self.graph.sample_neighbors(first, self.max_fanout_2, self.cosine_cutoff)
+            hop2_counts.append(len(second))
+            if len(second) == 0:
+                seeds_with_zero_second += 1
+            second_hop_all.extend(second)
+
+        first_hop = list(dict.fromkeys(first_hop_all))
+        _log_cuda_memory("subgraph_collate:after_first_hop")
+        second_hop = list(dict.fromkeys(second_hop_all))
+        _log_cuda_memory("subgraph_collate:after_second_hop")
+
+        nodes: list[int] = []
+        seen: set[int] = set()
+
+        def _append(idx: int) -> None:
+            if idx in seen:
+                return
+            seen.add(idx)
+            nodes.append(idx)
+
+        for idx in root_indices:
+            _append(idx)
+        for idx in first_hop:
+            _append(idx)
+        for idx in second_hop:
+            _append(idx)
+
+        go_prior = batch[0].get("go_prior") if batch else None
+        samples: list[Dict[str, torch.Tensor]] = []
+
+        for idx in nodes:
+            if idx in root_lookup:
+                sample = dict(root_lookup[idx])
+            else:
+                sample = dict(self.dataset[idx])
+            sample.pop("protein_prior", None)
+            sample.pop("protein_prior_path", None)
+            sample.pop("protein_prior_index", None)
+            if go_prior is not None and "go_prior" not in sample:
+                sample["go_prior"] = go_prior
+            samples.append(sample)
+
+        collated = collate_manifest_batch(samples, protein_prior_cfg=self.protein_prior_cfg)
+        collated.pop("protein_prior", None)
+
+        adjacency = self.graph.subgraph_adjacency(nodes)
+        _log_cuda_memory("subgraph_collate:after_adjacency")
+        collated["protein_prior"] = adjacency
+        collated["node_indices"] = torch.tensor(nodes, dtype=torch.long)
+        root_mask = torch.tensor([idx in root_set for idx in nodes], dtype=torch.bool)
+        collated["target_mask"] = root_mask
+
+        root_positions = [nodes.index(idx) for idx in root_indices]
+        collated["root_indices"] = torch.tensor(root_positions, dtype=torch.long)
+        mean_hop1 = float(np.mean(hop1_counts)) if hop1_counts else 0.0
+        mean_hop2 = float(np.mean(hop2_counts)) if hop2_counts else 0.0
+        edge_count = int(torch.count_nonzero(adjacency > 0).item())
+        edge_count = max(edge_count - len(nodes), 0)
+        zero_second_pct = float(seeds_with_zero_second) / float(len(root_indices)) if root_indices else 0.0
+        collated["graph_stats"] = {
+            "nodes": float(len(nodes)),
+            "edges": float(edge_count),
+            "mean_hop1": mean_hop1,
+            "mean_hop2": mean_hop2,
+            "pct_seed_zero_second": zero_second_pct,
+        }
+        return collated
 
 
 class ManifestDataset(Dataset):
@@ -507,6 +879,7 @@ class ManifestDataset(Dataset):
             "seq_embeddings": seq_embeddings,
             "targets": labels.to(dtype=torch.float32),
         }
+        sample["node_index"] = torch.tensor(index, dtype=torch.long)
 
         if "lengths" in record:
             sample["lengths"] = self._load_tensor(record, key="lengths").to(torch.long)
@@ -722,6 +1095,7 @@ def build_manifest_dataloader(
     shuffle: bool,
     protein_prior_cfg: Optional[Mapping[str, Any]] = None,
     min_length: Optional[int] = None,
+    split: Optional[str] = None,
 ) -> Optional[DataLoader]:
     """Create a manifest-backed dataloader if a path is provided."""
 
@@ -732,17 +1106,45 @@ def build_manifest_dataloader(
         manifest_path = (base_dir / manifest_path).resolve()
     dataset = ManifestDataset(manifest_path, min_length=min_length)
 
-    def _collate(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        return collate_manifest_batch(batch, protein_prior_cfg=protein_prior_cfg)
+    neighbors_cfg = _resolve_neighbors_cfg(data_cfg)
+    split_key = f"global_{str(split).lower()}_path" if split else None
+    chosen_path = neighbors_cfg.get(split_key) if split_key else None
+    if not chosen_path:
+        chosen_path = neighbors_cfg.get("global_path")
+    neighbors_cfg["global_path"] = chosen_path
+
+    collate = NeighborSubgraphCollator(
+        dataset,
+        neighbors_cfg,
+        protein_prior_cfg=protein_prior_cfg,
+    )
+
+    if isinstance(data_cfg, MutableMapping):
+        neighbors_node = data_cfg.setdefault("neighbors", {})
+        if isinstance(neighbors_node, MutableMapping):
+            resolved_path = getattr(collate, "global_path", chosen_path)
+            if split_key and split_key in neighbors_node:
+                neighbors_node[split_key] = resolved_path
+            if "global_path" in neighbors_node:
+                neighbors_node["global_path"] = resolved_path
+        else:
+            try:
+                data_cfg["neighbors"] = {"global_path": getattr(collate, "global_path", None)}
+                if split_key:
+                    data_cfg["neighbors"][split_key] = getattr(collate, "global_path", None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    neighbors_cfg["global_path"] = getattr(collate, "global_path", neighbors_cfg.get("global_path"))
 
     return DataLoader(
         dataset,
-        batch_size=int(data_cfg["batch_size"]),
+        batch_size=int(neighbors_cfg["batch_size"]),
         shuffle=shuffle,
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", False)),
         drop_last=bool(data_cfg.get("drop_last", False)),
-        collate_fn=_collate,
+        collate_fn=collate,
     )
 
 

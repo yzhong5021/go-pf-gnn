@@ -29,15 +29,6 @@ scheduler:
   warmup_epochs: 3
   min_lr: 0.00001
 
-data:
-  train_manifest: null
-  val_manifest: null
-  test_manifest: null
-  batch_size: 12
-  num_workers: 2
-  pin_memory: true
-  drop_last: false
-
 evaluation:
   metric: fmax
   val_interval: 1

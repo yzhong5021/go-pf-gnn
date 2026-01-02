@@ -30,7 +30,15 @@ go_prior:
     BP: 1536
     CC: 768
 
-batch_size: 24
+neighbors:
+  batch_size: 24
+  top_k: 20
+  fanout_1: 20
+  fanout_2: 10
+  global_path: null
+  global_train_path: null
+  global_val_path: null
+  global_test_path: null
 min_length: 10
 train_manifest: null
 val_manifest: null

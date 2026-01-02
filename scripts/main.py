@@ -1,4 +1,4 @@
-"""Convenience CLI to train or run inference for PF-AGCN."""
+"""Convenience CLI to train, tune, or run inference for PF-AGCN."""
 
 from __future__ import annotations
 
@@ -25,11 +25,13 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from preprocessing import ManifestBundle, prepare_manifests
+from src.hpo import run_hpo_command
+from preprocessing import ManifestBundle, prepare_manifests, set_cache_root
 from train.training import run_training
 from utils.system_runtime import apply_system_env
 
 log = logging.getLogger(__name__)
+DEFAULT_CACHE_PATH = Path("/orcd/home/002/lerchen/code/cafa_proj/data")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -55,6 +57,39 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         choices=["MF", "BP", "CC", "mf", "bp", "cc"],
         required=True,
         help="GO aspect to train (mf, bp, or cc)",
+    )
+
+    hpo_parser = subparsers.add_parser("hpo", help="Run Optuna hyperparameter search")
+    hpo_parser.add_argument(
+        "--config-path",
+        type=str,
+        default="configs",
+        help="Path to Hydra config directory",
+    )
+    hpo_parser.add_argument(
+        "--config-name",
+        type=str,
+        default="default_config",
+        help="Hydra config name",
+    )
+    hpo_parser.add_argument(
+        "--aspect",
+        type=str,
+        choices=["MF", "BP", "CC", "mf", "bp", "cc"],
+        required=True,
+        help="GO aspect to train during HPO (mf, bp, or cc)",
+    )
+    hpo_parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=40,
+        help="Number of Optuna trials to run",
+    )
+    hpo_parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=45,
+        help="Max epochs per Optuna trial (overrides config)",
     )
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained model")
@@ -125,6 +160,19 @@ def _compose_config(
     return cfg
 
 
+def _resolve_cache_root(cfg: DictConfig) -> Path:
+    value = OmegaConf.select(cfg, "cache_path", default=None)
+    if value is None:
+        value = OmegaConf.select(cfg, "system.paths.cache_path", default=None)
+    fallback = os.environ.get("PF_AGCN_CACHE", str(DEFAULT_CACHE_PATH))
+    base = Path(str(value or fallback)).expanduser()
+    if not base.is_absolute():
+        base = (PROJECT_ROOT / base).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    set_cache_root(base)
+    return base
+
+
 def _finalize_hydra_runtime(cfg: DictConfig, config_path: str | Path, config_name: str) -> None:
     """Populate hydra.runtime fields so hydra.* interpolations resolve when composed manually."""
 
@@ -181,7 +229,7 @@ def _load_manifest_meta(manifest_path: Path) -> Dict[str, Any]:
     return data.get("meta", {})
 
 
-def _ensure_manifests(cfg: DictConfig, aspect: str) -> List[str]:
+def _ensure_manifests(cfg: DictConfig, aspect: str, cache_root: Path) -> List[str]:
     overrides: List[str] = []
     aspect_upper = aspect.upper()
 
@@ -197,7 +245,8 @@ def _ensure_manifests(cfg: DictConfig, aspect: str) -> List[str]:
     if existing_manifest:
         manifest_path = Path(existing_manifest)
         if not manifest_path.is_absolute():
-            manifest_path = (PROJECT_ROOT / manifest_path).resolve()
+            candidate = (cache_root / manifest_path).resolve()
+            manifest_path = candidate if candidate.exists() else (PROJECT_ROOT / manifest_path).resolve()
         meta = _load_manifest_meta(manifest_path)
         manifest_aspect = str(meta.get("aspect", aspect_upper)).upper()
         if manifest_aspect != aspect_upper:
@@ -207,18 +256,23 @@ def _ensure_manifests(cfg: DictConfig, aspect: str) -> List[str]:
             raise ValueError(f"Manifest at {manifest_path} is missing 'num_functions' metadata")
         overrides.append(f"task.num_functions={int(num_functions)}")
         feature_dim_meta = meta.get("feature_dim")
-        if feature_dim_meta is not None:
-            overrides.append(f"model.seq_embeddings.feature_dim={int(feature_dim_meta)}")
         backend_meta = meta.get("embedding_backend")
         if backend_meta:
             overrides.append(f"model.seq_embeddings.backend={backend_meta}")
+        effective_backend = str(backend_meta or backend).lower()
+        if feature_dim_meta is not None:
+            feature_dim_meta = int(feature_dim_meta)
+            if effective_backend == "esm" and feature_dim_meta != feature_dim:
+                overrides.append(f"model.seq_embeddings.raw_dim={feature_dim_meta}")
+            else:
+                overrides.append(f"model.seq_embeddings.feature_dim={feature_dim_meta}")
         if not data_cfg.get("val_manifest"):
             overrides.append(f"data_config.val_manifest={manifest_path.as_posix()}")
         if not data_cfg.get("test_manifest"):
             overrides.append(f"data_config.test_manifest={manifest_path.as_posix()}")
         return overrides
 
-    manifest_root = (PROJECT_ROOT / "data" / "manifests").resolve()
+    manifest_root = (cache_root / "manifests").resolve()
     bundle: ManifestBundle = prepare_manifests(
         data_cfg=data_cfg,
         output_root=manifest_root,
@@ -227,6 +281,7 @@ def _ensure_manifests(cfg: DictConfig, aspect: str) -> List[str]:
         max_length=max_length,
         protein_prior_cfg=prot_prior_cfg,
         embedding_backend=backend,
+        cache_root=cache_root,
     )
     overrides.extend(
         [
@@ -234,10 +289,14 @@ def _ensure_manifests(cfg: DictConfig, aspect: str) -> List[str]:
             f"data_config.val_manifest={bundle.val.as_posix()}",
             f"data_config.test_manifest={bundle.test.as_posix()}",
             f"task.num_functions={bundle.num_functions}",
-            f"model.seq_embeddings.feature_dim={bundle.feature_dim}",
             f"model.seq_embeddings.backend={bundle.embedding_backend}",
         ]
     )
+    bundle_backend = str(bundle.embedding_backend).lower()
+    if bundle_backend == "esm" and bundle.feature_dim != feature_dim:
+        overrides.append(f"model.seq_embeddings.raw_dim={bundle.feature_dim}")
+    else:
+        overrides.append(f"model.seq_embeddings.feature_dim={bundle.feature_dim}")
     return overrides
 
 
@@ -245,13 +304,15 @@ def run_train_command(
     config_path: str, config_name: str, aspect: str, hydra_overrides: Optional[List[str]] = None
 ) -> None:
     aspect_upper = aspect.upper()
-    overrides = [f"+aspect={aspect_upper}"]
+    overrides: List[str] = []
     if hydra_overrides:
         overrides.extend(hydra_overrides)
+    overrides.append(f"+aspect={aspect_upper}")
     cfg = _compose_config(config_path, config_name, overrides)
     _finalize_hydra_runtime(cfg, config_path, config_name)
+    cache_root = _resolve_cache_root(cfg)
     apply_system_env(cfg)
-    manifest_overrides = _ensure_manifests(cfg, aspect_upper)
+    manifest_overrides = _ensure_manifests(cfg, aspect_upper, cache_root)
     if manifest_overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(manifest_overrides))
     run_training(cfg)
@@ -263,6 +324,7 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
     if args.aspect:
         cli_overrides.append(f"aspect={args.aspect.upper()}")
     cfg = _compose_config(config_path.parent, config_path.stem, cli_overrides)
+    cache_root = _resolve_cache_root(cfg)
     apply_system_env(cfg)
     data_cfg = OmegaConf.to_container(cfg.data_config, resolve=True)
     seq_cfg = OmegaConf.to_container(cfg.model.seq_embeddings, resolve=True)
@@ -275,7 +337,12 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
     aspect = (args.aspect or cfg.get("aspect") or "").upper()
 
     if args.manifest:
-        manifest_path = Path(args.manifest).resolve()
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_absolute():
+            candidate = (cache_root / manifest_path).resolve()
+            manifest_path = candidate if candidate.exists() else (PROJECT_ROOT / manifest_path).resolve()
+        else:
+            manifest_path = manifest_path.resolve()
         meta = _load_manifest_meta(manifest_path)
         manifest_aspect = str(meta.get("aspect", aspect or "")).upper()
         if aspect and manifest_aspect and manifest_aspect != aspect:
@@ -293,7 +360,12 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
             continue
         manifest_path = Path(candidate)
         if not manifest_path.is_absolute():
-            manifest_path = (PROJECT_ROOT / manifest_path).resolve()
+            candidate_path = (cache_root / manifest_path).resolve()
+            manifest_path = (
+                candidate_path if candidate_path.exists() else (PROJECT_ROOT / manifest_path).resolve()
+            )
+        else:
+            manifest_path = manifest_path.resolve()
         meta = _load_manifest_meta(manifest_path)
         manifest_aspect = str(meta.get("aspect", aspect or "")).upper()
         if aspect and manifest_aspect and manifest_aspect != aspect:
@@ -305,7 +377,7 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
     if not aspect:
         raise ValueError("Aspect must be specified when auto-generating inference manifests.")
 
-    manifest_root = (PROJECT_ROOT / "data" / "manifests").resolve()
+    manifest_root = (cache_root / "manifests").resolve()
     bundle = prepare_manifests(
         data_cfg=data_cfg,
         output_root=manifest_root,
@@ -314,9 +386,11 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
         max_length=max_length,
         protein_prior_cfg=prot_prior_cfg,
         embedding_backend=backend,
+        cache_root=cache_root,
     )
     log.info("Generated inference manifest at %s", bundle.test)
     return bundle.test.as_posix()
+
 
 def run_predict(args: argparse.Namespace) -> None:
     from scripts.predict import main as predict_main
@@ -336,12 +410,24 @@ def run_predict(args: argparse.Namespace) -> None:
     predict_main(predict_argv)
 
 
-
 def main(argv: Optional[List[str]] = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args(argv or sys.argv[1:])
     if args.command == "train":
         run_train_command(args.config_path, args.config_name, args.aspect, args.hydra_overrides)
+    elif args.command == "hpo":
+        run_hpo_command(
+            args.config_path,
+            args.config_name,
+            args.aspect,
+            args.n_trials,
+            args.max_epochs,
+            args.hydra_overrides,
+            _compose_config,
+            _finalize_hydra_runtime,
+            _resolve_cache_root,
+            _ensure_manifests,
+        )
     elif args.command == "predict":
         if getattr(args, "hydra_overrides", None):
             raise ValueError("Hydra overrides are only supported for the 'train' command.")
@@ -350,4 +436,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-

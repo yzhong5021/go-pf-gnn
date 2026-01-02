@@ -36,8 +36,8 @@ def _build_top_p_attention(
 
     vals, idx = torch.sort(logits, dim=1, descending=True)
     probs_sorted = F.softmax(vals, dim=1)
-    csum = torch.cumsum(probs_sorted, dim=1)
-    k_i = (csum < p).sum(dim=1) + 1
+    csum = torch.cumsum(probs_sorted.detach().cpu(), dim=1)
+    k_i = (csum < p).sum(dim=1).to(device=logits.device) + 1
 
     N = logits.size(1)
     ranks = torch.arange(N, device=logits.device).unsqueeze(0).expand_as(vals)

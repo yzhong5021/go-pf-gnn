@@ -21,6 +21,16 @@ from src.modules.dataloader import (
 )
 
 
+def _write_neighbor_npz(manifest_path: Path, top_k: int) -> Path:
+    stem = manifest_path.stem
+    out = manifest_path.parent / f"{stem}_neighbors_top{top_k}.npz"
+    n = 2
+    neighbors = np.tile(np.arange(n, dtype=np.int64), (n, 1))[:, :top_k]
+    weights = np.ones_like(neighbors, dtype=np.float16)
+    np.savez_compressed(out, neighbors=neighbors, weights=weights)
+    return out
+
+
 def test_dataframe_to_multi_hot() -> None:
     annotations = pd.DataFrame(
         {
@@ -104,8 +114,8 @@ def test_load_npz_tensor_preserves_dtype(tmp_path: Path) -> None:
 def test_manifest_dataset_and_collate(tmp_path: Path) -> None:
     emb0 = tmp_path / "emb0.npy"
     emb1 = tmp_path / "emb1.npy"
-    np.save(emb0, np.random.randn(3, 4).astype("float32"))
-    np.save(emb1, np.random.randn(2, 4).astype("float32"))
+    np.save(emb0, np.ones((3, 4), dtype="float32"))
+    np.save(emb1, np.full((2, 4), 0.5, dtype="float32"))
 
     protein_prior_path = tmp_path / "protein_prior.npy"
     np.save(protein_prior_path, np.eye(3, dtype="float32"))
@@ -133,9 +143,27 @@ def test_manifest_dataset_and_collate(tmp_path: Path) -> None:
     dataset = ManifestDataset(manifest_path)
     sample0 = dataset[0]
     assert sample0["go_prior"].dtype == torch.float16
-    go_prior_path.unlink()
     sample1 = dataset[1]
     assert torch.equal(sample0["go_prior"], sample1["go_prior"])
+    assert int(sample0["node_index"]) == 0
+
+    torch.manual_seed(0)
+    _write_neighbor_npz(manifest_path, top_k=2)
+    loader = build_manifest_dataloader(
+        str(manifest_path),
+        {"neighbors": {"batch_size": 1, "top_k": 2, "fanout_1": 1, "fanout_2": 0}},
+        base_dir=tmp_path,
+        shuffle=False,
+    )
+    assert loader is not None
+    batch = next(iter(loader))
+
+    assert batch["seq_embeddings"].shape[0] == 2
+    assert batch["target_mask"].tolist() == [True, False]
+    assert batch["protein_prior"].shape == (2, 2)
+    assert torch.allclose(batch["protein_prior"].diag(), torch.ones(2))
+    assert batch["root_indices"].tolist() == [0]
+    assert torch.count_nonzero(batch["protein_prior"]).item() >= 3
 
 
 def test_manifest_dataset_go_prior_key_priority(tmp_path: Path) -> None:
@@ -182,7 +210,13 @@ def test_manifest_dataset_go_prior_key_priority(tmp_path: Path) -> None:
     assert collated["targets"].shape == (2, 2)
     assert collated["go_prior"].shape == (2, 2)
 
-    loader = build_manifest_dataloader(str(manifest_path), {"batch_size": 1}, base_dir=tmp_path, shuffle=False)
+    _write_neighbor_npz(manifest_path, top_k=1)
+    loader = build_manifest_dataloader(
+        str(manifest_path),
+        {"neighbors": {"batch_size": 1, "top_k": 1, "fanout_1": 1, "fanout_2": 0}},
+        base_dir=tmp_path,
+        shuffle=False,
+    )
     assert loader is not None
     assert len(loader.dataset) == 2
 

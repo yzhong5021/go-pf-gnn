@@ -15,10 +15,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence, Set
 
-TRAIN_ROOT = Path("/orcd/home/002/lerchen/code/cafa6/Train")
+TRAIN_ROOT = Path("/orcd/home/002/lerchen/code/cafa_proj/cafa6/Train")
 SEQUENCES_PATH = TRAIN_ROOT / "train_sequences.fasta"
 TERMS_PATH = TRAIN_ROOT / "train_terms.tsv"
-OUTPUT_ROOT = Path("/orcd/home/002/lerchen/code/cafa6/Train_slice")
+OUTPUT_ROOT = Path("/orcd/home/002/lerchen/code/cafa_proj/cafa6/Train_slice")
 SLICE_NAME = "train"
 
 ASPECT_NORMALISER = {

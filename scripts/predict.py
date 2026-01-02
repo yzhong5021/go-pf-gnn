@@ -90,7 +90,9 @@ def main(argv: list[str] | None = None) -> None:
     protein_prior_cfg = model_cfg.get("prot_prior") if isinstance(model_cfg, dict) else None
     if args.batch_size is not None:
         data_cfg = dict(data_cfg)
-        data_cfg["batch_size"] = args.batch_size
+        neighbors_cfg = dict(data_cfg.get("neighbors", {}))
+        neighbors_cfg["batch_size"] = args.batch_size
+        data_cfg["neighbors"] = neighbors_cfg
 
     dataloader = build_manifest_dataloader(
         manifest=args.manifest,
@@ -106,13 +108,17 @@ def main(argv: list[str] | None = None) -> None:
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            logits = model(
+            output = model(
                 seq_embeddings=batch["seq_embeddings"],
                 lengths=batch.get("lengths"),
                 mask=batch.get("mask"),
                 protein_prior=batch.get("protein_prior"),
                 go_prior=batch.get("go_prior"),
             )
+            logits = output.logits if hasattr(output, "logits") else output
+            target_mask = batch.get("target_mask")
+            if target_mask is not None:
+                logits = logits[target_mask]
             probs = torch.sigmoid(logits).cpu().numpy()
             records.append(probs)
 

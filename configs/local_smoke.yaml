@@ -10,6 +10,7 @@ defaults:
   - system: local_low
   - _self_
 
+cache_path: ${oc.env:PF_AGCN_CACHE,/orcd/home/002/lerchen/code/cafa_proj/data}
 experiment_name: "pfagcn_local_smoke"
 run_name: "pf-agcn-smoke"
 resume: false
@@ -18,7 +19,12 @@ data_config:
   train_manifest: 
   val_manifest: 
   test_manifest: 
-  batch_size: 2
+  neighbors:
+    batch_size: 2
+    top_k: 20
+    fanout_1: 20
+    fanout_2: 10
+    global_path: null
   num_workers: 0
   pin_memory: false
 

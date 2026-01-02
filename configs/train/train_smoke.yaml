@@ -27,15 +27,6 @@ optimizer:
 scheduler:
   name: none
 
-data:
-  train_manifest: null
-  val_manifest: null
-  test_manifest: null
-  batch_size: 2
-  num_workers: 0
-  pin_memory: false
-  drop_last: false
-
 evaluation:
   metric:
     - fmax

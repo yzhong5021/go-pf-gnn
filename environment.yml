@@ -26,4 +26,4 @@ dependencies:
       - cafaeval>=1.2.1
       - transformers>=4.37
       - sentencepiece>=0.2.0
-      - hydra-optuna-sweeper>=1.2
+      - optuna-integration==4.6.0

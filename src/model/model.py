@@ -7,6 +7,7 @@ using cached sequence embeddings and priors supplied at runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 from types import SimpleNamespace
 
@@ -55,7 +56,21 @@ class PFAGCN(nn.Module):
         model_cfg = config.model
         self.num_functions = config.task.num_functions
 
-        seq_dim = model_cfg.seq_embeddings.feature_dim
+        seq_cfg = model_cfg.seq_embeddings
+        seq_dim = seq_cfg.feature_dim
+        backend_value = getattr(seq_cfg, "backend", "esm") or "esm"
+        seq_backend = str(backend_value).lower()
+        raw_dim = getattr(seq_cfg, "raw_dim", None)
+        if seq_backend == "esm":
+            raw_dim = int(raw_dim) if raw_dim is not None else 1280
+        self.seq_input_dim = seq_dim
+        if seq_backend == "esm" and raw_dim != seq_dim:
+            self.seq_input_dim = int(raw_dim)
+            self.seq_projector = nn.Linear(self.seq_input_dim, seq_dim, bias=False)
+            nn.init.xavier_uniform_(self.seq_projector.weight)
+        else:
+            self.seq_projector = nn.Identity()
+
         dccn_channels = model_cfg.dccn.channels
         graph_dim = model_cfg.seq_final.graph_dim
         shared_dim = model_cfg.seq_gating.shared_dim
@@ -217,13 +232,14 @@ class PFAGCN(nn.Module):
     ) -> Output:
         """Run end-to-end inference with cached sequence embeddings."""
 
+        self._log_cuda_memory("forward:start")
         if seq_embeddings.ndim != 3:
             raise ValueError("seq_embeddings must be a 3D tensor (batch, length, dim).")
 
         batch, seqlen, feat_dim = seq_embeddings.shape
         # print("batch, seqlen, features:", [batch, seqlen, feat_dim])
         
-        expected_dim = self.config.model.seq_embeddings.feature_dim
+        expected_dim = self.seq_input_dim
         if feat_dim != expected_dim:
             raise ValueError(
                 f"Expected seq_embeddings feature dim {expected_dim}, got {feat_dim}."
@@ -232,6 +248,8 @@ class PFAGCN(nn.Module):
         if mask is None and lengths is None:
             raise ValueError("Either lengths or mask must be provided.")
 
+        seq_embeddings = self.seq_projector(seq_embeddings)
+        self._log_cuda_memory("after seq_projector")
         device = seq_embeddings.device
         mask_bool, lengths_tensor = self._normalise_mask(lengths, mask, batch, seqlen, device)
 
@@ -241,8 +259,10 @@ class PFAGCN(nn.Module):
             log.debug("GO prior enabled but missing; proceeding without it for this batch.")
 
         embeddings_projected = self.dccn_input(seq_embeddings)
+        self._log_cuda_memory("after dccn_input")
         # print("\n\n\nEmbeddings_projected", embeddings_projected.shape)
         conv_features = self.dccn(embeddings_projected, mask=mask_bool)
+        self._log_cuda_memory("after dccn")
         # print("\n\n\nConv_features", conv_features.shape)
 
         
@@ -252,11 +272,16 @@ class PFAGCN(nn.Module):
             lengths=lengths_tensor,
             mask=mask_bool,
         )
+        self._log_cuda_memory("after seq_gating")
 
         # print("\n\n\nGating_repr", gating_repr.shape)
 
         if self.graph_structure == "decoupled":
-            function_init, protein_init = self.seq_final(gating_repr, mode="decoupled")
+            function_init, protein_init = self.seq_final(
+                gating_repr,
+                mode="decoupled",
+            )
+            self._log_cuda_memory("after seq_final")
             protein_prior_matrix = self._resolve_protein_prior(protein_init, protein_prior)
             function_prior_matrix = self._resolve_function_prior(
                 go_prior, function_init.device, function_init.dtype
@@ -268,10 +293,16 @@ class PFAGCN(nn.Module):
                 self.function_blocks, function_init, function_prior_matrix
             )
             logits, protein_embeddings, function_embeddings = self.head(
-                function_features, protein_features
+                function_features,
+                protein_features,
             )
+            self._log_cuda_memory("after head")
         else:
-            shared_features = self.seq_final(gating_repr, mode="alternating")
+            shared_features = self.seq_final(
+                gating_repr,
+                mode="alternating",
+            )
+            self._log_cuda_memory("after seq_final")
             protein_prior_matrix = self._resolve_protein_prior(shared_features, protein_prior)
             function_prior_matrix = self._resolve_function_prior(
                 go_prior, shared_features.device, shared_features.dtype
@@ -280,8 +311,13 @@ class PFAGCN(nn.Module):
                 shared_features, protein_prior_matrix, function_prior_matrix
             )
             logits = self.alternating_classifier(shared_features).squeeze(-1)
+            self._log_cuda_memory("after alternating_classifier")
             protein_embeddings = self.protein_summary_pool(shared_features)
-            function_embeddings = self.function_summary_pool(shared_features.permute(1, 0, 2))
+            self._log_cuda_memory("after protein_summary_pool")
+            function_embeddings = self.function_summary_pool(
+                shared_features.permute(1, 0, 2)
+            )
+            self._log_cuda_memory("after function_summary_pool")
 
         protein_adj = self._ensure_adjacency(
             protein_adj,
@@ -302,6 +338,16 @@ class PFAGCN(nn.Module):
             function_embeddings=function_embeddings,
             protein_adjacency=protein_adj,
             function_adjacency=function_adj,
+        )
+
+    def _log_cuda_memory(self, label: str) -> None:  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        if not torch.cuda.is_available():  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+            log.info("CUDA not available; skipping memory log.")  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+            return  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        mem_mb = torch.cuda.memory_allocated() / 1e6  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+        log.info(  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
+            "CUDA memory %s at %s: %.2f MB", label, timestamp, mem_mb  # TEMPORARY; ONLY FOR ASSESSING MEMORY USE.
         )
 
     def _normalise_mask(
@@ -342,8 +388,11 @@ class PFAGCN(nn.Module):
         if not blocks:
             return current, None
 
+        idx = 0
         for block in blocks:
             current = block(current, prior=prior)
+            self._log_cuda_memory(f"{block.__class__.__name__}[{idx}]")
+            idx += 1
             adjacency = getattr(block, "last_attention", None)
         return current, adjacency
 
@@ -357,9 +406,12 @@ class PFAGCN(nn.Module):
         function_adj: Optional[torch.Tensor] = None
         current = features
 
+        idx = 0
         for block in self.alternating_blocks:
             prior = protein_prior if block.axis == "protein" else function_prior
             current = block(current, prior=prior)
+            self._log_cuda_memory(f"{block.__class__.__name__}[{idx}]")
+            idx += 1
             if block.axis == "protein":
                 protein_adj = getattr(block, "last_attention", None)
             else:

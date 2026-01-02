@@ -131,7 +131,8 @@ class AdaptiveDiffusionBlock(nn.Module):
             attn = self._adj_from_feats(pooled)
             if node_mask is not None:
                 attn = self._mask_attention(attn, node_mask)
-            self.last_attention = attn
+            # Store a detached view to avoid retaining the full autograd graph.
+            self.last_attention = attn.detach()
 
             Xf = self._apply_graph(Rf, Xf)
             if self.bidirectional and Rb is not None and Xb is not None:

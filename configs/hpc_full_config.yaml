@@ -9,7 +9,8 @@ defaults:
   - system: hpc_supercloud
   - _self_
 
-experiment_name: "pfagcn_supercloud_test"
+cache_path: /orcd/scratch/orcd/009/lerchen/data
+experiment_name: "pfagcn_sweep_alternating"
 
 training:
   devices: 1
@@ -21,7 +22,7 @@ training:
 
 data_config:
   num_workers: 8
-  pin_memory: false
+  pin_memory: true
 
 evaluation:
   metric:

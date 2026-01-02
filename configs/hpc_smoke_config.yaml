@@ -9,6 +9,7 @@ defaults:
   - system: hpc_supercloud
   - _self_
 
+cache_path: ${oc.env:PF_AGCN_CACHE,/orcd/scratch/orcd/009/lerchen/data}
 experiment_name: "pfagcn_supercloud_test"
 
 mlflow:

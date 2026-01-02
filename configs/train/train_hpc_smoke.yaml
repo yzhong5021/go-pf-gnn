@@ -25,15 +25,7 @@ optimizer:
 
 scheduler:
   name: none
-
-data:
-  train_manifest: null
-  val_manifest: null
-  test_manifest: null
-  batch_size: 8
-  num_workers: 4
-  pin_memory: true
-  drop_last: false
+  gamma: 0.95  # for sweeping
 
 evaluation:
   metric:

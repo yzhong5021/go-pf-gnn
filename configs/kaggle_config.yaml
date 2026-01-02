@@ -10,6 +10,7 @@ defaults:
   - system: kaggle
   - _self_
 
+cache_path: ${oc.env:PF_AGCN_CACHE,/orcd/home/002/lerchen/code/cafa_proj/data}
 experiment_name: "pfagcn_kaggle_t4"
 resume: false
 

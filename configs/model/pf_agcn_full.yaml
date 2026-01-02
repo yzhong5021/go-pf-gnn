@@ -1,10 +1,11 @@
-﻿# configs/model/pf_agcn_compact.yaml
+﻿# configs/model/pf_agcn_full.yaml
 # Reduced PF-AGCN footprint for local smoke tests.
 
 seq_embeddings:
   cache_path: null
   backend: esm  # options: esm, prost
-  feature_dim: 1280
+  feature_dim: 512
+  raw_dim: 1280 # initial dimension of raw esm embeddings
   seq_len: 1024 # max length for sequence embeddings
   dtype: float32
 prot_prior:
@@ -40,7 +41,7 @@ seq_final:
   function_dim: ${..seq_gating.shared_dim}
   protein_dim: ${..seq_gating.shared_dim}
 graph:
-  structure: decoupled
+  structure: alternating
   protein_stacks: 2
   function_stacks: 2
   alternating_depth: 4

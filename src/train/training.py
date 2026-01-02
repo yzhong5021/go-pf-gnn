@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import hydra
 from hydra.utils import get_original_cwd
@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, StepLR
 
 from lightning.pytorch import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import MLFlowLogger
 
 from cafaeval.evaluation import compute_metrics as cafa_compute_metrics
@@ -53,6 +53,7 @@ def flatten_config(config: Mapping[str, Any], parent: str = "") -> Dict[str, Any
     for key, value in config.items():
         composite = f"{parent}.{key}" if parent else str(key)
         composite = composite.replace("@", "_")
+        composite = composite.replace("/", ".")
         if isinstance(value, Mapping):
             items.update(flatten_config(value, composite))
         elif isinstance(value, (list, tuple)):
@@ -382,6 +383,7 @@ class PFAGCNLightningModule(LightningModule):
         self.model = build_model(cfg)
         self.criterion = build_loss(cfg)
         self.best_ia_fmax = -float("inf")
+        self.final_ia_fmax = float("nan")
         self._val_store: Optional[_ValidationArrayStore] = None
         self._val_losses: List[float] = []
 
@@ -399,7 +401,12 @@ class PFAGCNLightningModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:  # noqa: ARG002
         logits = self.forward(batch)
-        logits, targets = self._sanitize_logits_and_targets(logits, batch["targets"], stage="train")
+        target_mask = batch.get("target_mask")
+        targets = batch["targets"]
+        if target_mask is not None:
+            targets = targets[target_mask]
+            logits = logits[target_mask]
+        logits, targets = self._sanitize_logits_and_targets(logits, targets, stage="train")
         loss = self.criterion(logits, targets)
         batch_size = targets.size(0)
         self.log(
@@ -420,6 +427,53 @@ class PFAGCNLightningModule(LightningModule):
             batch_size=batch_size,
             sync_dist=self._sync_dist,
         )
+        graph_stats = batch.get("graph_stats")
+        if graph_stats:
+            self.log(
+                "graph/nodes",
+                float(graph_stats.get("nodes", 0.0)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=self._sync_dist,
+            )
+            self.log(
+                "graph/edges",
+                float(graph_stats.get("edges", 0.0)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=self._sync_dist,
+            )
+            self.log(
+                "graph/mean_neighbors_hop1",
+                float(graph_stats.get("mean_hop1", 0.0)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=self._sync_dist,
+            )
+            self.log(
+                "graph/mean_neighbors_hop2",
+                float(graph_stats.get("mean_hop2", 0.0)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=self._sync_dist,
+            )
+            self.log(
+                "graph/pct_seed_zero_second",
+                float(graph_stats.get("pct_seed_zero_second", 0.0)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size,
+                sync_dist=self._sync_dist,
+            )
         return loss
 
     def on_validation_epoch_start(self) -> None:
@@ -432,7 +486,12 @@ class PFAGCNLightningModule(LightningModule):
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> None:  # noqa: ARG002
         logits = self.forward(batch)
-        logits, targets = self._sanitize_logits_and_targets(logits, batch["targets"], stage="val")
+        targets = batch["targets"]
+        target_mask = batch.get("target_mask")
+        if target_mask is not None:
+            targets = targets[target_mask]
+            logits = logits[target_mask]
+        logits, targets = self._sanitize_logits_and_targets(logits, targets, stage="val")
         loss = self.criterion(logits, targets)
         probabilities = torch.sigmoid(logits)
         if not torch.isfinite(probabilities).all():
@@ -521,6 +580,7 @@ class PFAGCNLightningModule(LightningModule):
                 prog_bar=False,
             )
 
+        self.final_ia_fmax = float(metrics["ia_fmax"])
         self.best_ia_fmax = max(self.best_ia_fmax, metrics["ia_fmax"])
 
     def configure_optimizers(self) -> Any:
@@ -609,6 +669,29 @@ def _resolve_mlflow_names(cfg: Any, mlflow_cfg: Mapping[str, Any]) -> Tuple[str,
     return experiment_name, run_name
 
 
+def _with_active_mlflow_run(logger: MLFlowLogger, action: Callable[[], None]) -> None:
+    """Execute an MLflow action with the logger's run active."""
+
+    if not isinstance(logger, MLFlowLogger):
+        return
+    run_id = getattr(logger, "run_id", None)
+    tracking_uri = getattr(logger, "_tracking_uri", None)
+    if not run_id or not tracking_uri:
+        return
+
+    mlflow.set_tracking_uri(tracking_uri)
+    active_run = mlflow.active_run()
+    started_run = False
+    if active_run is None or active_run.info.run_id != run_id:
+        mlflow.start_run(run_id=run_id)
+        started_run = True
+    try:
+        action()
+    finally:
+        if started_run:
+            mlflow.end_run()
+
+
 class MLflowModelSaver(Callback):
     """Callback to log the trained model to MLflow once per run."""
 
@@ -622,19 +705,14 @@ class MLflowModelSaver(Callback):
         logger = trainer.logger
         if not isinstance(logger, MLFlowLogger):
             return
-        run_id = logger.run_id
-        tracking_uri = logger._tracking_uri
-        mlflow.set_tracking_uri(tracking_uri)
-        active_run = mlflow.active_run()
-        started_run = False
-        if active_run is None or active_run.info.run_id != run_id:
-            mlflow.start_run(run_id=run_id)
-            started_run = True
-        try:
-            mlflow.pytorch.log_model(pl_module.model, artifact_path="model")
-        finally:
-            if started_run:
-                mlflow.end_run()
+        _with_active_mlflow_run(
+            logger,
+            lambda: mlflow.pytorch.log_model(
+                pl_module.model,
+                name="model",
+                signature=False,  # Skip signature inference; model needs multiple tensor inputs.
+            ),
+        )
         self.logged = True
 
 
@@ -668,6 +746,18 @@ def _prepare_mlflow_logger(cfg: DictConfig, base_dir: Path) -> MLFlowLogger:
     return logger
 
 
+def _log_terminal_cafa_metrics(
+    logger: MLFlowLogger, *, best_ia_fmax: float, final_ia_fmax: float
+) -> None:
+    """Write summary IA F-max values to MLflow at the end of training."""
+
+    metrics = {
+        "cafa/ia_fmax_best": float(best_ia_fmax),
+        "cafa/ia_fmax_final": float(final_ia_fmax),
+    }
+    _with_active_mlflow_run(logger, lambda: mlflow.log_metrics(metrics))
+
+
 def _precision_arg(cfg: DictConfig) -> Any:
     precision_cfg = int(cfg.training.get("precision", 32))
     if precision_cfg == 16:
@@ -692,8 +782,12 @@ def _configure_tensor_core_precision() -> None:
 ###### Hydra main ######
 
 
-def run_training(cfg: DictConfig) -> float:
+def run_training(cfg: DictConfig, extra_callbacks: Optional[List[Callback]] = None) -> float:
     """Execute PF-AGCN training with a pre-resolved Hydra config.
+
+    Args:
+        cfg: Fully composed Hydra config.
+        extra_callbacks: Additional Lightning callbacks (e.g., Optuna pruning).
 
     Returns:
         Best IA F-max achieved during validation (float) for Optuna sweeps.
@@ -718,6 +812,7 @@ def run_training(cfg: DictConfig) -> float:
         shuffle=True,
         protein_prior_cfg=prot_prior_cfg,
         min_length=min_length,
+        split="train",
     )
     if train_loader is None:
         raise RuntimeError("Training manifest is required to start training.")
@@ -728,6 +823,7 @@ def run_training(cfg: DictConfig) -> float:
         shuffle=False,
         protein_prior_cfg=prot_prior_cfg,
         min_length=None,
+        split="val",
     )
 
     thresholds = list(cfg.evaluation.get("threshold_grid", [0.5]))
@@ -764,6 +860,42 @@ def run_training(cfg: DictConfig) -> float:
         LearningRateMonitor(logging_interval="epoch"),
         model_saver,
     ]
+    early_stop_metric = cfg.training.get("early_stop") if hasattr(cfg.training, "get") else getattr(
+        cfg.training, "early_stop", None
+    )
+    if early_stop_metric:
+        monitor = str(early_stop_metric)
+        lower = monitor.lower()
+        cafa_metrics = {
+            "ia_fmax",
+            "fmax",
+            "precision",
+            "recall",
+            "pr_auc",
+            "ap",
+            "ia_precision",
+            "ia_recall",
+            "ia_threshold",
+            "roc_auc",
+        }
+        if "/" not in monitor and lower in cafa_metrics:
+            monitor = f"cafa/{monitor}"
+        mode = "min" if "loss" in lower else "max"
+        patience_val = (
+            int(cfg.training.get("patience", 5))
+            if hasattr(cfg.training, "get")
+            else int(getattr(cfg.training, "patience", 5))
+        )
+        callbacks.append(
+            EarlyStopping(
+                monitor=monitor,
+                mode=mode,
+                patience=patience_val,
+                verbose=True,
+            )
+        )
+    if extra_callbacks:
+        callbacks.extend(list(extra_callbacks))
 
     trainer_kwargs: Dict[str, Any] = {
         "logger": mlflow_logger,
@@ -805,7 +937,19 @@ def run_training(cfg: DictConfig) -> float:
         best_metric = float(callback_metric)
     if not np.isfinite(best_metric):
         best_metric = 0.0
-    log.info("Best IA F-max achieved: %.4f", best_metric)
+    final_metric = float(getattr(model, "final_ia_fmax", float("nan")))
+    if not np.isfinite(final_metric) and callback_metric is not None:
+        final_metric = float(callback_metric)
+    if not np.isfinite(final_metric):
+        final_metric = best_metric
+
+    _log_terminal_cafa_metrics(
+        mlflow_logger,
+        best_ia_fmax=best_metric,
+        final_ia_fmax=final_metric,
+    )
+
+    log.info("Best IA F-max achieved: %.4f (final=%.4f)", best_metric, final_metric)
     return best_metric
 
 
@@ -817,5 +961,3 @@ def main(cfg: DictConfig) -> float:
 
 if __name__ == "__main__":
     main()
-
-

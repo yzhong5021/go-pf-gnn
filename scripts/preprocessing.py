@@ -34,12 +34,40 @@ from utils.prot_prior import prot_prior_blast
 
 log = logging.getLogger(__name__)
 
+DEFAULT_CACHE_ROOT = Path(
+    os.environ.get("PF_AGCN_CACHE", "/orcd/home/002/lerchen/code/cafa_proj/data")
+).expanduser()
+
+
+def _normalize_cache_root(path: Optional[str | Path]) -> Path:
+    base = Path(path or DEFAULT_CACHE_ROOT).expanduser()
+    if not base.is_absolute():
+        base = (PROJECT_ROOT / base).resolve()
+    return base.resolve()
+
+
+def _build_embed_cache_roots(base: Path) -> Dict[str, Path]:
+    return {
+        "esm": (base / "esm_cache").resolve(),
+        "prost": (base / "prost_cache").resolve(),
+    }
+
+
+CACHE_ROOT = _normalize_cache_root(None)
+EMBED_CACHE_ROOTS = _build_embed_cache_roots(CACHE_ROOT)
+
+
+def set_cache_root(path: Optional[str | Path]) -> Path:
+    """Update module-level cache roots (embeddings, splits, manifests)."""
+
+    global CACHE_ROOT, EMBED_CACHE_ROOTS
+    CACHE_ROOT = _normalize_cache_root(path)
+    EMBED_CACHE_ROOTS = _build_embed_cache_roots(CACHE_ROOT)
+    return CACHE_ROOT
+
+
 ASPECT_CHOICES = {"MF", "BP", "CC"}
 EMBED_BACKENDS = {"esm", "prost"}
-EMBED_CACHE_ROOTS = {
-    "esm": (PROJECT_ROOT / "data" / "esm_cache").resolve(),
-    "prost": (PROJECT_ROOT / "data" / "prost_cache").resolve(),
-}
 EMBEDDER_FACTORIES = {
     "esm": ESM_Embed,
     "prost": ProstEmbed,
@@ -201,7 +229,7 @@ def _ensure_embeddings_for_entries(
 
 
 def _resolve_split_paths(data_cfg: Mapping[str, Any]) -> Dict[str, Path]:
-    defaults_root = (PROJECT_ROOT / "data" / "splits").resolve()
+    defaults_root = (CACHE_ROOT / "splits").resolve()
     defaults_root.mkdir(parents=True, exist_ok=True)
     resolved: Dict[str, Path] = {}
     for split in ("train", "val", "test"):
@@ -354,7 +382,9 @@ def prepare_manifests(
     max_length: Optional[int] = None,
     protein_prior_cfg: Optional[Mapping[str, Any]] = None,
     embedding_backend: str = "esm",
+    cache_root: Optional[Path | str] = None,
 ) -> ManifestBundle:
+    set_cache_root(cache_root)
     aspect = aspect.upper()
     if aspect not in ASPECT_CHOICES:
         raise ValueError(f"Unsupported aspect '{aspect}'. Expected one of {sorted(ASPECT_CHOICES)}")

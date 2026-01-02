@@ -1,20 +1,20 @@
 # configs/system/hpc_supercloud.yaml
 # MIT SuperCloud-friendly runtime defaults.
 
-seed: 42
+# seed: 42
 cudnn_deterministic: true
 cudnn_benchmark: false
 
 paths:
-  cache_dir: /state/partition1/user/lerchen/cache # currently useless;
-  data_root: /orcd/home/002/lerchen/code/cafa6
-  results_root: /orcd/home/002/lerchen/code/results
+  # cache_dir: /state/partition1/user/lerchen/cache
+  data_root: /orcd/home/002/lerchen/code/cafa_proj/cafa6
+  results_root: /orcd/home/002/lerchen/code/cafa_proj/results
 
 mlflow:
-  tracking_uri: file:/orcd/home/002/lerchen/code/mlruns
-  artifact_root: file:/orcd/home/002/lerchen/code/mlruns
-  experiment_name: pfagcn_supercloud
-  run_name: pf-agcn-hpc
+  tracking_uri: file:/orcd/home/002/lerchen/code/cafa_proj/mlruns_opt
+  artifact_root: file:/orcd/home/002/lerchen/code/cafa_proj/mlruns_opt
+  # experiment_name: pfagcn_optuna
+  run_name: pf-agcn-decoupled-sweep
 
 env:
   OMP_NUM_THREADS: 20
