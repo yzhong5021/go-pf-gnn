@@ -29,9 +29,17 @@ from src.hpo import run_hpo_command
 from preprocessing import ManifestBundle, prepare_manifests, set_cache_root
 from train.training import run_training
 from utils.system_runtime import apply_system_env
+from utils.manifest_paths import resolve_manifest_path_template
 
 log = logging.getLogger(__name__)
 DEFAULT_CACHE_PATH = Path("/orcd/home/002/lerchen/code/cafa_proj/data")
+
+
+def _register_resolvers() -> None:
+    if not OmegaConf.has_resolver("oc.div"):
+        OmegaConf.register_new_resolver(
+            "oc.div", lambda a, b: int(float(a)) // int(float(b))
+        )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -236,12 +244,23 @@ def _ensure_manifests(cfg: DictConfig, aspect: str, cache_root: Path) -> List[st
     data_cfg = OmegaConf.to_container(cfg.data_config, resolve=True)
     seq_cfg = OmegaConf.to_container(cfg.model.seq_embeddings, resolve=True)
     prot_prior_cfg = OmegaConf.to_container(cfg.model.prot_prior, resolve=True)
+    structure_cfg = (
+        OmegaConf.to_container(cfg.model.structural_graph, resolve=True)
+        if getattr(cfg.model, "structural_graph", None) is not None
+        else {}
+    )
+    prostt5_cfg = (
+        OmegaConf.to_container(cfg.model.prostt5_3di, resolve=True)
+        if getattr(cfg.model, "prostt5_3di", None) is not None
+        else {}
+    )
     feature_dim = int(seq_cfg["feature_dim"])
-    max_len_val = seq_cfg.get("seq_len")
-    max_length = int(max_len_val) if max_len_val else None
     backend = str(seq_cfg.get("backend", "esm") or "esm").lower()
 
-    existing_manifest = data_cfg.get("train_manifest")
+    existing_manifest = resolve_manifest_path_template(
+        data_cfg.get("train_manifest"),
+        aspect=aspect_upper,
+    )
     if existing_manifest:
         manifest_path = Path(existing_manifest)
         if not manifest_path.is_absolute():
@@ -278,9 +297,10 @@ def _ensure_manifests(cfg: DictConfig, aspect: str, cache_root: Path) -> List[st
         output_root=manifest_root,
         aspect=aspect_upper,
         feature_dim=feature_dim,
-        max_length=max_length,
         protein_prior_cfg=prot_prior_cfg,
         embedding_backend=backend,
+        structure_cfg=structure_cfg,
+        prostt5_cfg=prostt5_cfg,
         cache_root=cache_root,
     )
     overrides.extend(
@@ -330,8 +350,6 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
     seq_cfg = OmegaConf.to_container(cfg.model.seq_embeddings, resolve=True)
     prot_prior_cfg = OmegaConf.to_container(cfg.model.prot_prior, resolve=True)
     feature_dim = int(seq_cfg["feature_dim"])
-    max_len_val = seq_cfg.get("seq_len")
-    max_length = int(max_len_val) if max_len_val else None
     backend = str(seq_cfg.get("backend", "esm") or "esm").lower()
 
     aspect = (args.aspect or cfg.get("aspect") or "").upper()
@@ -356,7 +374,10 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
         data_cfg.get("val_manifest"),
         data_cfg.get("train_manifest"),
     ):
+        candidate = resolve_manifest_path_template(candidate, aspect=aspect)
         if not candidate:
+            continue
+        if "{aspect" in str(candidate):
             continue
         manifest_path = Path(candidate)
         if not manifest_path.is_absolute():
@@ -383,7 +404,6 @@ def _resolve_manifest_for_predict(args: argparse.Namespace) -> str:
         output_root=manifest_root,
         aspect=aspect,
         feature_dim=feature_dim,
-        max_length=max_length,
         protein_prior_cfg=prot_prior_cfg,
         embedding_backend=backend,
         cache_root=cache_root,
@@ -411,7 +431,12 @@ def run_predict(args: argparse.Namespace) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        stream=sys.stdout,
+    )
+    _register_resolvers()
     args = parse_args(argv or sys.argv[1:])
     if args.command == "train":
         run_train_command(args.config_path, args.config_name, args.aspect, args.hydra_overrides)

@@ -1,0 +1,37 @@
+# paths and parameters for cafa data
+dataset_root: /orcd/home/002/lerchen/code/cafa_proj/cafa6
+train_dir: ${.dataset_root}/Train
+
+sources:
+  seqs_path: ${..train_dir}/train_sequences.fasta
+  terms_path: ${..train_dir}/train_terms.tsv
+  ia_path: ${..dataset_root}/IA.tsv
+  go_path: ${..train_dir}/go-basic.obo
+
+split:
+  seed: 1337
+  ratios:
+    train: 0.8
+    val: 0.2
+    test: 0.0
+
+train_csv: null
+val_csv: null
+test_csv: null
+embeddings_npz: null
+go_prior_npz: null
+structure_npz_dir: null
+
+go_prior:
+  obo_path: ${..sources.go_path}
+  train_split_csv: null
+  top_k:
+    MF: null
+    BP: null
+    CC: null
+
+batch_size: 64
+min_length: 10
+train_manifest: null
+val_manifest: null
+test_manifest: null

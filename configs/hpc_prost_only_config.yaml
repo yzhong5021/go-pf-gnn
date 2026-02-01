@@ -1,0 +1,89 @@
+# HPC config for ProstT5-only training using Train_slice manifests.
+
+defaults:
+  - data_config: cafa_hpc
+  - task: pf_agcn
+  - model: prost_only
+  - train@_here_: train_hpc_full
+  - hpo: optuna_search
+  - system: hpc_supercloud
+  - _self_
+
+cache_path: /home/lerchen/orcd/scratch/data/esm_final
+experiment_name: "prost_only"
+
+mlflow:
+  experiment_name: ${..experiment_name}
+
+training:
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  log_interval: 0
+  num_nodes: 1
+  max_epochs: 20
+  early_stop: ia_fmax
+  patience: 5
+  default_root_dir: ${hydra:runtime.output_dir}
+
+data_config:
+  num_workers: 8
+  pin_memory: true
+  batch_cache_dir: ${cache_path}/batch_cache
+  train_manifest: ${cache_path}/manifests/train/{aspect_lower}_manifest.json
+  val_manifest: ${cache_path}/manifests/val/{aspect_lower}_manifest.json
+  test_manifest: ${cache_path}/manifests/test/{aspect_lower}_manifest.json
+
+evaluation:
+  metric:
+  - fmax
+  - pr_auc_micro
+  - pr_auc_macro
+  val_interval: 1
+  threshold_grid:
+    - 0.0
+    - 0.1
+    - 0.2
+    - 0.21
+    - 0.22
+    - 0.23
+    - 0.24
+    - 0.25
+    - 0.26
+    - 0.27
+    - 0.28
+    - 0.29
+    - 0.3
+    - 0.31
+    - 0.32
+    - 0.33
+    - 0.34
+    - 0.35
+    - 0.36
+    - 0.37
+    - 0.38
+    - 0.39
+    - 0.4
+    - 0.41
+    - 0.42
+    - 0.43
+    - 0.44
+    - 0.45
+    - 0.46
+    - 0.47
+    - 0.48
+    - 0.49
+    - 0.5
+    - 0.6
+    - 0.7
+    - 0.8
+
+
+hydra:
+  run:
+    dir: ${system.paths.results_root}/runs/${now:%Y%m%d-%H%M%S}
+  job:
+    chdir: true
+  sweep:
+    dir: ${system.paths.results_root}/sweeps/${now:%Y%m%d}
+    subdir: ${now:%H%M%S}

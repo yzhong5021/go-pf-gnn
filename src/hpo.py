@@ -24,7 +24,7 @@ DEFAULT_SEARCH_SPACE: List[Mapping[str, Any]] = [
     {"name": "model.graph.protein_stacks", "type": "int", "low": 2, "high": 4, "step": 1},
     {"name": "model.seq_gating.dropout", "type": "float", "low": 0.0, "high": 0.5},
     {
-        "name": "data_config.neighbors.batch_size",
+        "name": "data_config.batch_size",
         "type": "categorical",
         "choices": [32, 64, 96],
     },

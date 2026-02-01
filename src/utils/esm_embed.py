@@ -7,6 +7,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 from transformers import EsmModel, EsmTokenizer
 
 
@@ -16,10 +17,9 @@ class ESM_Embed(nn.Module):
     def __init__(
         self,
         model_name: str = "facebook/esm2_t33_650M_UR50D",
-        max_len: int = 1022,
-        truncate_len: int = 1000,
         device: str | torch.device = "cpu",
         cache_dir: Optional[str | Path] = None,
+        chunk_len: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
@@ -37,31 +37,57 @@ class ESM_Embed(nn.Module):
         for parameter in self.model.parameters():
             parameter.requires_grad = False
 
-        self.max_len = int(max_len)
-        self.truncate_len = int(truncate_len)
+        config = getattr(self.model, "config", None)
+        max_positions = getattr(config, "max_position_embeddings", None)
+        default_chunk = max(1, int(max_positions) - 2) if max_positions else 1022
+        self.chunk_len = int(chunk_len) if chunk_len is not None else default_chunk
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(self.model, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError("Unable to determine ESM hidden size for empty inputs.")
+        self.hidden_size = int(hidden_size)
         self.cls_id = self.tokenizer.cls_token_id
         self.eos_id = self.tokenizer.eos_token_id
         self.pad_id = self.tokenizer.pad_token_id
 
+    def _embed_single(self, sequence: str) -> torch.Tensor:
+        if not sequence:
+            return torch.zeros((0, self.hidden_size), device=self.device)
+        chunks = [
+            sequence[start : start + self.chunk_len]
+            for start in range(0, len(sequence), self.chunk_len)
+        ]
+        embeddings: list[torch.Tensor] = []
+        for chunk in chunks:
+            batch = self.tokenizer(
+                [chunk],
+                return_tensors="pt",
+                padding=False,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True,
+            )
+            batch = {key: value.to(self.device) for key, value in batch.items()}
+            outputs = self.model(**batch)
+            input_ids = batch["input_ids"]
+            residue_mask = (input_ids != self.pad_id) & (input_ids != self.cls_id) & (
+                input_ids != self.eos_id
+            )
+            embeddings.append(outputs.last_hidden_state[0][residue_mask[0]])
+        return torch.cat(embeddings, dim=0)
+
     @torch.inference_mode()
     def get_esm_embed(self, seqs: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return residue-level embeddings and masks for provided sequences."""
-        sequences = [seq if len(seq) <= self.max_len else seq[:self.truncate_len] for seq in seqs]
-
-        batch = self.tokenizer(
-            sequences,
-            return_tensors="pt",
-            padding=True,
-            truncation=False, # truncation is done prior
-            add_special_tokens=True,
-            return_attention_mask=True,
-        )
-        batch = {key: value.to(self.device) for key, value in batch.items()}
-
-        outputs = self.model(**batch)
-        input_ids = batch["input_ids"]
-        residue_mask = (input_ids != self.pad_id) & (input_ids != self.cls_id) & (input_ids != self.eos_id)
-        return outputs.last_hidden_state, residue_mask
+        embeddings = [self._embed_single(seq) for seq in seqs]
+        if not embeddings:
+            empty = torch.empty((0, 0, self.hidden_size), device=self.device)
+            return empty, torch.empty((0, 0), dtype=torch.bool, device=self.device)
+        lengths = torch.tensor([emb.size(0) for emb in embeddings], device=self.device)
+        padded = pad_sequence(embeddings, batch_first=True)
+        mask = torch.arange(padded.size(1), device=self.device)[None, :] < lengths[:, None]
+        return padded, mask
 
     @torch.inference_mode()
     def forward(self, seqs: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:

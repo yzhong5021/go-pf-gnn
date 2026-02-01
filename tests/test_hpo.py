@@ -110,6 +110,6 @@ def test_run_hpo_command_uses_cli_overrides(monkeypatch, tmp_path) -> None:
         assert cfg["training"]["max_epochs"] == 5
         assert cfg.get("aspect") == "BP"
         assert cfg["hpo"]["study"]["n_trials"] == 2
-        assert cfg["data_config"]["neighbors"]["batch_size"] in {32, 64, 96}
+        assert cfg["data_config"]["batch_size"] in {32, 64, 96}
         assert cfg["scheduler"]["name"] == "step"
         assert cfg["optimizer"]["lr"] > 0

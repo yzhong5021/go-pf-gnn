@@ -10,12 +10,12 @@ training:
   gradient_clip: 1.0
   precision: 32
   accumulate_batches: 1
-  log_interval: 50
+  log_interval: 0
   devices: 1
   accelerator: auto
   strategy: null
   deterministic: true
-  enable_progress_bar: true
+  enable_progress_bar: false
   limit_train_batches: null
   limit_val_batches: null
   fast_dev_run: false
@@ -28,7 +28,8 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 2
+  decay_epochs: 49
   min_lr: 0.000005
   gamma: 0.95  # for sweeping
 
@@ -38,4 +39,40 @@ evaluation:
   - pr_auc_micro
   - pr_auc_macro
   val_interval: 1
-  threshold_grid: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  threshold_grid:
+    - 0.0
+    - 0.1
+    - 0.2
+    - 0.21
+    - 0.22
+    - 0.23
+    - 0.24
+    - 0.25
+    - 0.26
+    - 0.27
+    - 0.28
+    - 0.29
+    - 0.3
+    - 0.31
+    - 0.32
+    - 0.33
+    - 0.34
+    - 0.35
+    - 0.36
+    - 0.37
+    - 0.38
+    - 0.39
+    - 0.4
+    - 0.41
+    - 0.42
+    - 0.43
+    - 0.44
+    - 0.45
+    - 0.46
+    - 0.47
+    - 0.48
+    - 0.49
+    - 0.5
+    - 0.6
+    - 0.7
+    - 0.8

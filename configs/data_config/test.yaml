@@ -19,6 +19,7 @@ val_csv:   ${cache_path}/splits/val.csv
 test_csv:  ${cache_path}/splits/test.csv
 embeddings_npz: ${system.cache_dir}/esm1b_cafa.npz
 go_prior_npz:   ${system.cache_dir}/go_prior_cafa.npz
+structure_npz_dir: null
 
 go_prior:
   obo_path: ${..sources.go_path}
@@ -28,15 +29,7 @@ go_prior:
     BP: 100
     CC: 100
 
-neighbors:
-  batch_size: 64
-  top_k: 20
-  fanout_1: 20
-  fanout_2: 10
-  global_path: null
-  global_train_path: null
-  global_val_path: null
-  global_test_path: null
+batch_size: 64
 min_length: 10
 train_manifest: null
 val_manifest: null

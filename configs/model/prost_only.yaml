@@ -1,0 +1,36 @@
+# ProstT5-only MLP classifier configuration.
+
+arch: prost_only
+
+seq_embeddings:
+  cache_path: null
+  backend: esm
+  feature_dim: 1280
+  raw_dim: 1280
+  dtype: float32
+
+prot_prior:
+  enabled: false
+  method: cosine
+  cache_path: null
+  sim_threshold: 0.3
+
+go_prior:
+  enabled: false
+  cache_path: null
+
+prostt5_3di:
+  encoder_dim: 1024
+
+prost_graph:
+  enabled: false
+  dropout: 0.1
+
+loss:
+  name: focal
+  pos_weight: null
+  focusing: 2.0
+  balancing: 0.25
+  gamma_positive: 0.0
+  gamma_negative: 4.0
+  clip: 0.025

@@ -19,12 +19,7 @@ data_config:
   train_manifest: 
   val_manifest: 
   test_manifest: 
-  neighbors:
-    batch_size: 2
-    top_k: 20
-    fanout_1: 20
-    fanout_2: 10
-    global_path: null
+  batch_size: 2
   num_workers: 0
   pin_memory: false
 

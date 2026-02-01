@@ -20,25 +20,17 @@ val_csv: null
 test_csv: null
 embeddings_npz: null
 go_prior_npz: null
+structure_npz_dir: null
 
 go_prior:
   obo_path: ${..sources.go_path}
   train_split_csv: null
   top_k:
-    MF: 528
-    BP: 1024
-    CC: 528
+    MF: null
+    BP: null
+    CC: null
 
-neighbors:
-  batch_size: 64
-  top_k: 20
-  cosine_cutoff: 0.3
-  max_fanout_1: 2
-  max_fanout_2: 1
-  global_train_path: null
-  global_val_path: null
-  global_test_path: null
-  
+batch_size: 64
 min_length: 10
 train_manifest: null
 val_manifest: null

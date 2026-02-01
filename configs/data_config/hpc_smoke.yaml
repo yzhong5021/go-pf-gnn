@@ -23,6 +23,7 @@ val_csv: null
 test_csv: null
 embeddings_npz: null
 go_prior_npz: null
+structure_npz_dir: null
 
 go_prior:
   obo_path: ${..sources.go_path}
@@ -32,15 +33,7 @@ go_prior:
     BP: 256
     CC: 128
 
-neighbors:
-  batch_size: 8
-  top_k: 20
-  fanout_1: 20
-  fanout_2: 10
-  global_path: null
-  global_train_path: null
-  global_val_path: null
-  global_test_path: null
+batch_size: 8
 min_length: 10
 train_manifest: null
 val_manifest: null

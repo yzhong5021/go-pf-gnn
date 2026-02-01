@@ -6,7 +6,6 @@ seq_embeddings:
   backend: esm  # options: esm, prost
   feature_dim: 512
   raw_dim: 1280 # initial dimension of raw esm embeddings
-  seq_len: 1024 # max length for sequence embeddings
   dtype: float32
 prot_prior:
   enabled: true
@@ -25,6 +24,7 @@ go_prior:
   temperature: 1.0
   symmetric: true
 dccn:
+  enabled: true  # ablation study
   channels: 512
   kernel_size: 3
   dilation: 2
@@ -66,3 +66,8 @@ head:
 loss:
   name: bce_with_logits
   pos_weight: null
+  focusing: 2.0
+  balancing: 0.25 # positive class weight; <0.5 favors negatives
+  gamma_positive: 0.0
+  gamma_negative: 4.0
+  clip: 0.025

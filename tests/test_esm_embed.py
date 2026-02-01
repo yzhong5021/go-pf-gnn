@@ -15,7 +15,8 @@ class DummyTokenizer:
         self.store = store
 
     def __call__(self, sequences, **kwargs):
-        self.store["called_with"] = list(sequences)
+        calls = self.store.setdefault("called_with", [])
+        calls.append(list(sequences))
         batch = torch.tensor([[0, 3, 2, 1], [0, 4, 2, 1]])
         return {"input_ids": batch, "attention_mask": torch.ones_like(batch)}
 
@@ -24,6 +25,7 @@ class DummyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.param = nn.Parameter(torch.ones(1))
+        self.config = SimpleNamespace(hidden_size=4, max_position_embeddings=12)
 
     def forward(self, **batch):
         input_ids = batch["input_ids"]
@@ -45,12 +47,13 @@ def test_esm_embed_get_embed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(esm_embed.EsmTokenizer, "from_pretrained", lambda *args, **kwargs: DummyTokenizer(store))
     monkeypatch.setattr(esm_embed.EsmModel, "from_pretrained", lambda *args, **kwargs: DummyModel())
 
-    embedder = esm_embed.ESM_Embed(model_name="dummy", max_len=5, truncate_len=3)
+    embedder = esm_embed.ESM_Embed(model_name="dummy", chunk_len=10)
 
     hidden, mask = embedder.get_esm_embed(["ABCDEFG", "HI"])
 
-    assert store["called_with"][0] == "ABC"
-    assert hidden.shape == mask.shape + (4,)
+    assert store["called_with"][0][0] == "ABCDEFG"
+    assert store["called_with"][1][0] == "HI"
+    assert hidden.shape[:2] == mask.shape
+    assert hidden.shape[-1] == 4
     assert mask.dtype == torch.bool
-    assert torch.equal(mask[0], torch.tensor([False, True, False, False]))
     assert all(not param.requires_grad for param in embedder.model.parameters())

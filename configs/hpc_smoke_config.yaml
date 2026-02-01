@@ -19,12 +19,14 @@ training:
   devices: 1
   accelerator: gpu
   precision: 16
-  log_interval: 20
+  log_interval: 0
   num_nodes: 1
 
 data_config:
   num_workers: 8
   pin_memory: true
+  structure_npz_dir: ${cache_path}/esmfold_cache
+  batch_cache_dir: ${cache_path}/batch_cache
 
 evaluation:
   metric:

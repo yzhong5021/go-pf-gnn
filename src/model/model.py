@@ -71,7 +71,9 @@ class PFAGCN(nn.Module):
         else:
             self.seq_projector = nn.Identity()
 
-        dccn_channels = model_cfg.dccn.channels
+        dccn_cfg = model_cfg.dccn
+        self.use_dccn = bool(getattr(dccn_cfg, "enabled", True))  # ablation study
+        dccn_channels = dccn_cfg.channels
         graph_dim = model_cfg.seq_final.graph_dim
         shared_dim = model_cfg.seq_gating.shared_dim
         prot_prior_cfg = getattr(model_cfg, "prot_prior", SimpleNamespace())
@@ -92,12 +94,15 @@ class PFAGCN(nn.Module):
         else:
             self.dccn_input = nn.Identity()
 
-        self.dccn = DCCN_1D(
-            embed_len=dccn_channels,
-            k_size=model_cfg.dccn.kernel_size,
-            dilation=model_cfg.dccn.dilation,
-            dropout=model_cfg.dccn.dropout,
-        )
+        if self.use_dccn:  # ablation study
+            self.dccn = DCCN_1D(
+                embed_len=dccn_channels,
+                k_size=dccn_cfg.kernel_size,
+                dilation=dccn_cfg.dilation,
+                dropout=dccn_cfg.dropout,
+            )
+        else:
+            self.dccn = nn.Identity()  # ablation study
 
         self.seq_gating = SeqGating(
             d_shared=shared_dim,
@@ -261,7 +266,10 @@ class PFAGCN(nn.Module):
         embeddings_projected = self.dccn_input(seq_embeddings)
         self._log_cuda_memory("after dccn_input")
         # print("\n\n\nEmbeddings_projected", embeddings_projected.shape)
-        conv_features = self.dccn(embeddings_projected, mask=mask_bool)
+        if self.use_dccn:  # ablation study
+            conv_features = self.dccn(embeddings_projected, mask=mask_bool)
+        else:
+            conv_features = embeddings_projected  # ablation study
         self._log_cuda_memory("after dccn")
         # print("\n\n\nConv_features", conv_features.shape)
 

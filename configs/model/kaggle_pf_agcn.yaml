@@ -5,7 +5,6 @@ seq_embeddings:
   cache_path: ${system.cache_dir}/seq_embeddings
   backend: esm
   feature_dim: 256
-  seq_len: 1024
   dtype: float16
 
 prot_prior:
@@ -27,6 +26,7 @@ go_prior:
   symmetric: true
 
 dccn:
+  enabled: true  # ablation study
   channels: 96
   kernel_size: 3
   dilation: 2

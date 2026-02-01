@@ -1,0 +1,91 @@
+# Optimized MF training config for gated_pe (best HPO trial params).
+
+defaults:
+  - data_config: cafa_hpc
+  - task: pf_agcn
+  - model: gated_pe
+  - train@_here_: train_hpc_full
+  - system: hpc_supercloud
+  - _self_
+
+cache_path: /home/lerchen/orcd/scratch/data/esm_final
+experiment_name: "gated_pe_mf_opt"
+
+training:
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  log_interval: 0
+  num_nodes: 1
+  deterministic: false
+  max_epochs: 50
+  patience: 6
+  seed: 42
+  default_root_dir: ${hydra:runtime.output_dir}
+
+optimizer:
+  name: adamw
+  lr: 6.24564612705163e-05
+  weight_decay: 0.006089394826714454
+  betas: [0.9, 0.999]
+  eps: 1.0e-08
+
+scheduler:
+  name: cosine
+  warmup_epochs: 2
+  warmup_lr: 2.1828208204847342e-07
+  decay_epochs: 49
+  min_lr: 2.967161845658433e-05
+  gamma: 0.95
+
+mlflow:
+  experiment_name: ${..experiment_name}
+
+system:
+  env:
+    CUDNN_BENCHMARK: 1
+    CUDNN_DETERMINISTIC: 0
+
+data_config:
+  num_workers: 8
+  pin_memory: true
+  batch_size: 64
+  structure_npz_dir: ${cache_path}/af_graphs
+  batch_cache_dir: ${cache_path}/batch_cache
+  train_manifest: ${cache_path}/manifests/train/{aspect_lower}_manifest.json
+  val_manifest: ${cache_path}/manifests/val/{aspect_lower}_manifest.json
+  test_manifest: ${cache_path}/manifests/test/{aspect_lower}_manifest.json
+
+model:
+  structural_graph:
+    graph_source: alphafold
+    graph_cache_dir: ${cache_path}/af_graphs
+    device: cuda
+  prostt5_3di:
+    device: cuda
+  gcn:
+    dropout: 0.09727296192284733
+  prost_graph:
+    dropout: 0.09727296192284733
+  gated_pe:
+    mlp_dropout: 0.09727296192284733
+  loss:
+    focusing: 3.9726953162373615
+    balancing: 0.30525651512239704
+
+evaluation:
+  metric:
+  - fmax
+  - pr_auc_micro
+  - pr_auc_macro
+  val_interval: 1
+  threshold_grid: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+
+hydra:
+  run:
+    dir: ${system.paths.results_root}/runs/${now:%Y%m%d-%H%M%S}
+  job:
+    chdir: true
+  sweep:
+    dir: ${system.paths.results_root}/sweeps/${now:%Y%m%d}
+    subdir: ${now:%H%M%S}

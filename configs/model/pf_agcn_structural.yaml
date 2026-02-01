@@ -1,0 +1,96 @@
+# configs/model/pf_agcn_structural.yaml
+# Structural + ProstT5 cross-attention PF-AGCN configuration.
+
+arch: structural_prost
+
+seq_embeddings:
+  cache_path: null
+  backend: esm
+  feature_dim: 1280
+  raw_dim: 1280
+  dtype: float32
+
+prot_prior:
+  enabled: false
+  method: cosine
+  cache_path: null
+  sim_threshold: 0.3
+
+go_prior:
+  enabled: false
+  cache_path: null
+
+sqb:
+  channels: 256
+  dccn:
+    kernel_size: 3
+    dilation: 2
+    dropout: 0.1
+
+structural_graph:
+  enabled: true
+  graph_source: alphafold
+  graph_cache_dir: null
+  model_name: facebook/esmfold_v1
+  num_recycles: null
+  add_special_tokens: false
+  distance_cutoff: 10.0
+  top_k: 20
+  cache_dir: null
+  device: cpu
+
+gcn:
+  dropout: 0.1
+
+prostt5_3di:
+  enabled: ${..prost_attention.enabled}
+  model_name: Rostlab/ProstT5
+  prefix_token: "<AA2fold>"
+  encoder_dim: 1024
+  three_di_tokens:
+    - A
+    - B
+    - C
+    - D
+    - E
+    - F
+    - G
+    - H
+    - I
+    - J
+    - K
+    - L
+    - M
+    - N
+    - O
+    - P
+    - Q
+    - R
+    - S
+    - T
+  three_di_token_ids: null
+  cache_dir: null
+  device: cpu
+
+prost_attention:
+  enabled: true
+
+prost_graph:
+  enabled: false
+  dropout: 0.1
+
+cross_attention:
+  heads: 4
+  dropout: 0.1
+
+prediction_head:
+  mlp_hidden_dim: ${oc.div:${..sqb.channels},2}
+
+loss:
+  name: focal
+  pos_weight: null
+  focusing: 2.0
+  balancing: 0.25
+  gamma_positive: 0.0
+  gamma_negative: 4.0
+  clip: 0.025

@@ -21,16 +21,6 @@ from src.modules.dataloader import (
 )
 
 
-def _write_neighbor_npz(manifest_path: Path, top_k: int) -> Path:
-    stem = manifest_path.stem
-    out = manifest_path.parent / f"{stem}_neighbors_top{top_k}.npz"
-    n = 2
-    neighbors = np.tile(np.arange(n, dtype=np.int64), (n, 1))[:, :top_k]
-    weights = np.ones_like(neighbors, dtype=np.float16)
-    np.savez_compressed(out, neighbors=neighbors, weights=weights)
-    return out
-
-
 def test_dataframe_to_multi_hot() -> None:
     annotations = pd.DataFrame(
         {
@@ -147,11 +137,9 @@ def test_manifest_dataset_and_collate(tmp_path: Path) -> None:
     assert torch.equal(sample0["go_prior"], sample1["go_prior"])
     assert int(sample0["node_index"]) == 0
 
-    torch.manual_seed(0)
-    _write_neighbor_npz(manifest_path, top_k=2)
     loader = build_manifest_dataloader(
         str(manifest_path),
-        {"neighbors": {"batch_size": 1, "top_k": 2, "fanout_1": 1, "fanout_2": 0}},
+        {"batch_size": 2},
         base_dir=tmp_path,
         shuffle=False,
     )
@@ -159,11 +147,122 @@ def test_manifest_dataset_and_collate(tmp_path: Path) -> None:
     batch = next(iter(loader))
 
     assert batch["seq_embeddings"].shape[0] == 2
-    assert batch["target_mask"].tolist() == [True, False]
-    assert batch["protein_prior"].shape == (2, 2)
-    assert torch.allclose(batch["protein_prior"].diag(), torch.ones(2))
-    assert batch["root_indices"].tolist() == [0]
-    assert torch.count_nonzero(batch["protein_prior"]).item() >= 3
+    assert batch["protein_prior"].shape == (2, 3, 3)
+    assert torch.allclose(batch["protein_prior"][:, 0, 0], torch.ones(2))
+
+
+def test_manifest_dataset_with_structure_and_prost(tmp_path: Path) -> None:
+    emb0 = tmp_path / "emb0.npz"
+    emb1 = tmp_path / "emb1.npz"
+    np.savez_compressed(emb0, embeddings=np.ones((3, 4), dtype="float32"))
+    np.savez_compressed(emb1, embeddings=np.ones((5, 4), dtype="float32"))
+
+    adj0 = tmp_path / "adj0.npz"
+    adj1 = tmp_path / "adj1.npz"
+    edge_index0 = np.vstack([np.arange(3), np.arange(3)]).astype("int64")
+    edge_index1 = np.vstack([np.arange(5), np.arange(5)]).astype("int64")
+    np.savez_compressed(
+        adj0,
+        edge_index=edge_index0,
+        edge_weight=np.ones(3, dtype="float32"),
+        plddt=np.full(3, 90.0, dtype="float32"),
+    )
+    np.savez_compressed(
+        adj1,
+        edge_index=edge_index1,
+        edge_weight=np.ones(5, dtype="float32"),
+        plddt=np.full(5, 90.0, dtype="float32"),
+    )
+
+    probs0 = tmp_path / "probs0.npz"
+    probs1 = tmp_path / "probs1.npz"
+    np.savez_compressed(probs0, embeddings=np.full((3, 8), 0.05, dtype="float32"))
+    np.savez_compressed(probs1, embeddings=np.full((5, 8), 0.05, dtype="float32"))
+
+    manifest_path = tmp_path / "manifest.json"
+    records = [
+        {
+            "embedding_path": emb0.name,
+            "structure_path": adj0.name,
+            "prostt5_path": probs0.name,
+            "labels": [1, 0],
+            "lengths": [3],
+        },
+        {
+            "embedding_path": emb1.name,
+            "structure_path": adj1.name,
+            "prostt5_path": probs1.name,
+            "labels": [0, 1],
+            "lengths": [5],
+        },
+    ]
+    manifest_path.write_text(json.dumps(records), encoding="utf-8")
+
+    dataset = ManifestDataset(manifest_path, go_prior_enabled=False)
+    batch = collate_manifest_batch([dataset[0], dataset[1]])
+
+    assert batch["structure_graph"]["node_splits"].tolist() == [0, 3, 8]
+    assert batch["structure_graph"]["edge_index"].shape == (2, 8)
+    assert batch["structure_graph"]["plddt"].shape == (8,)
+    assert batch["prostt5_probs"].shape == (2, 5, 8)
+    assert torch.all(batch["prostt5_probs"][0, 3:] == 0)
+
+
+def test_build_manifest_dataloader_batches(tmp_path: Path) -> None:
+    emb0 = tmp_path / "emb0.npy"
+    emb1 = tmp_path / "emb1.npy"
+    emb2 = tmp_path / "emb2.npy"
+    np.save(emb0, np.zeros((2, 3), dtype="float32"))
+    np.save(emb1, np.ones((2, 3), dtype="float32"))
+    np.save(emb2, np.full((2, 3), 2.0, dtype="float32"))
+
+    manifest_path = tmp_path / "bp_manifest.json"
+    records = [
+        {"embedding_path": emb0.name, "labels": [1, 0, 0]},
+        {"embedding_path": emb1.name, "labels": [0, 1, 0]},
+        {"embedding_path": emb2.name, "labels": [0, 0, 1]},
+    ]
+    manifest_path.write_text(json.dumps(records), encoding="utf-8")
+
+    loader = build_manifest_dataloader(
+        str(manifest_path),
+        {"batch_size": 2},
+        base_dir=tmp_path,
+        shuffle=False,
+    )
+    assert loader is not None
+    batches = list(loader)
+    assert len(batches) == 2
+    assert batches[0]["targets"].shape == (2, 3)
+
+
+def test_build_manifest_dataloader_min_length(tmp_path: Path) -> None:
+    emb0 = tmp_path / "emb0.npy"
+    emb1 = tmp_path / "emb1.npy"
+    emb2 = tmp_path / "emb2.npy"
+    np.save(emb0, np.zeros((3, 2), dtype="float32"))
+    np.save(emb1, np.ones((1, 2), dtype="float32"))
+    np.save(emb2, np.full((3, 2), 2.0, dtype="float32"))
+
+    manifest_path = tmp_path / "bp_manifest.json"
+    records = [
+        {"embedding_path": emb0.name, "labels": [1, 0, 0]},
+        {"embedding_path": emb1.name, "labels": [0, 1, 0]},
+        {"embedding_path": emb2.name, "labels": [0, 0, 1]},
+    ]
+    manifest_path.write_text(json.dumps(records), encoding="utf-8")
+
+    loader = build_manifest_dataloader(
+        str(manifest_path),
+        {"batch_size": 2},
+        base_dir=tmp_path,
+        shuffle=False,
+        min_length=2,
+    )
+    assert loader is not None
+    batches = list(loader)
+    assert len(batches) == 1
+    assert batches[0]["targets"].shape == (2, 3)
 
 
 def test_manifest_dataset_go_prior_key_priority(tmp_path: Path) -> None:
@@ -210,10 +309,9 @@ def test_manifest_dataset_go_prior_key_priority(tmp_path: Path) -> None:
     assert collated["targets"].shape == (2, 2)
     assert collated["go_prior"].shape == (2, 2)
 
-    _write_neighbor_npz(manifest_path, top_k=1)
     loader = build_manifest_dataloader(
         str(manifest_path),
-        {"neighbors": {"batch_size": 1, "top_k": 1, "fanout_1": 1, "fanout_2": 0}},
+        {"batch_size": 1},
         base_dir=tmp_path,
         shuffle=False,
     )

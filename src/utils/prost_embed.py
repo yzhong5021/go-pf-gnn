@@ -30,7 +30,12 @@ class ProstEmbed(nn.Module):
         if self.cache_dir is not None:
             pretrained_kwargs["cache_dir"] = str(self.cache_dir)
 
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name, do_lower_case=False, **pretrained_kwargs)
+        self.tokenizer = T5Tokenizer.from_pretrained(
+            model_name,
+            do_lower_case=False,
+            legacy=True,
+            **pretrained_kwargs,
+        )
         self.model = T5EncoderModel.from_pretrained(model_name, **pretrained_kwargs)
         if self.device.type == "cpu":
             self.model.float()

@@ -36,7 +36,7 @@ hpo:
       type: float
       low: 0.0
       high: 0.5
-    - name: data_config.neighbors.batch_size
+    - name: data_config.batch_size
       type: categorical
       choices:
         - 32

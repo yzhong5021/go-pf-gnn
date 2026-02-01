@@ -21,6 +21,7 @@ val_csv:   ${.dataset_root}/splits/val.csv
 test_csv:  ${.dataset_root}/splits/test.csv
 embeddings_npz: ${system.cache_dir}/esm1b_pfagcn_kaggle.npz
 go_prior_npz:   ${system.cache_dir}/go_prior_pfagcn_kaggle.npz
+structure_npz_dir: null
 
 go_prior:
   obo_path: ${..sources.go_path}
@@ -30,15 +31,7 @@ go_prior:
     BP: 1536
     CC: 768
 
-neighbors:
-  batch_size: 24
-  top_k: 20
-  fanout_1: 20
-  fanout_2: 10
-  global_path: null
-  global_train_path: null
-  global_val_path: null
-  global_test_path: null
+batch_size: 24
 min_length: 10
 train_manifest: null
 val_manifest: null

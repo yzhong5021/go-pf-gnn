@@ -27,7 +27,7 @@ from modules.dataloader import (
     parse_fasta_sequences,
     parse_ground_truth_table,
 )
-from utils.esm_embed import ESM_Embed
+from modules.prostt5_3di import ProstT53DiEmbedder
 from utils.prost_embed import ProstEmbed
 from utils.go_prior import Go_Prior
 from utils.prot_prior import prot_prior_blast
@@ -50,6 +50,8 @@ def _build_embed_cache_roots(base: Path) -> Dict[str, Path]:
     return {
         "esm": (base / "esm_cache").resolve(),
         "prost": (base / "prost_cache").resolve(),
+        "esmfold": (base / "esmfold_cache").resolve(),
+        "prostt5_3di": (base / "prostt5_3di_cache").resolve(),
     }
 
 
@@ -68,11 +70,8 @@ def set_cache_root(path: Optional[str | Path]) -> Path:
 
 ASPECT_CHOICES = {"MF", "BP", "CC"}
 EMBED_BACKENDS = {"esm", "prost"}
-EMBEDDER_FACTORIES = {
-    "esm": ESM_Embed,
-    "prost": ProstEmbed,
-}
 _EMBEDDER_SINGLETONS: Dict[str, Any] = {}
+_PROST3DI_SINGLETON: Optional[ProstT53DiEmbedder] = None
 EMBED_BATCH_SIZE = max(1, int(os.environ.get("PF_AGCN_EMBED_BATCH", "8")))
 
 
@@ -100,23 +99,38 @@ def _coerce_path(value: Optional[str]) -> Optional[Path]:
     return path
 
 
+def _entry_cache_filename(entry_id: str) -> str:
+    safe_id = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in entry_id)
+    digest = hashlib.md5(entry_id.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_id or 'protein'}_{digest}.npz"
+
+
+def _entry_cache_path(entry_id: str, root: Path, *, mkdir: bool = True) -> Path:
+    if mkdir:
+        root.mkdir(parents=True, exist_ok=True)
+    return root / _entry_cache_filename(entry_id)
+
+
 def _embedding_cache_path(entry_id: str, backend: str) -> Path:
     root = EMBED_CACHE_ROOTS.get(backend)
     if root is None:
         raise ValueError(f"Unsupported embedding backend '{backend}'.")
-    root.mkdir(parents=True, exist_ok=True)
-    safe_id = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in entry_id)
-    digest = hashlib.md5(entry_id.encode("utf-8")).hexdigest()[:8]
-    filename = f"{safe_id or 'protein'}_{digest}.npz"
-    return root / filename
+    return _entry_cache_path(entry_id, root, mkdir=True)
+
+
+def _write_npz_cache(path: Path, key: str, array: np.ndarray) -> tuple[int, ...]:
+    """Persist arrays with float16 compression under a named key."""
+
+    cast = array.astype(np.float16, copy=False)
+    np.savez_compressed(path, **{key: cast})
+    return cast.shape
 
 
 def _write_embedding_cache(path: Path, array: np.ndarray) -> tuple[int, int]:
     """Persist embeddings with float16 compression."""
 
-    cast = array.astype(np.float16, copy=False)
-    np.savez_compressed(path, embeddings=cast)
-    return cast.shape
+    shape = _write_npz_cache(path, "embeddings", array)
+    return int(shape[0]), int(shape[1])
 
 
 def _read_embedding_metadata(path: Path) -> tuple[int, int]:
@@ -135,6 +149,18 @@ def _read_embedding_metadata(path: Path) -> tuple[int, int]:
     raise ValueError(f"Unsupported embedding cache format: {path.suffix}")
 
 
+def _read_npz_shape(path: Path, key: str) -> tuple[int, ...]:
+    """Return the stored array shape from an .npz file."""
+
+    archive = np.load(path, mmap_mode="r", allow_pickle=False)
+    try:
+        if key not in archive:
+            raise KeyError(f"Key '{key}' missing from {path.name}")
+        return tuple(int(val) for val in archive[key].shape)
+    finally:
+        archive.close()
+
+
 def _model_cache_dir(backend: str) -> Path:
     root = EMBED_CACHE_ROOTS.get(backend)
     if root is None:
@@ -144,33 +170,61 @@ def _model_cache_dir(backend: str) -> Path:
     return model_dir
 
 
-def _get_seq_embedder(max_length: Optional[int], backend: str):
+def _get_seq_embedder(backend: str):
     backend_key = backend.lower()
-    if backend_key not in EMBEDDER_FACTORIES:
+    if backend_key not in EMBED_BACKENDS:
         raise ValueError(
-            f"Unsupported embedding backend '{backend}'. Expected one of {sorted(EMBEDDER_FACTORIES)}"
+            f"Unsupported embedding backend '{backend}'. Expected one of {sorted(EMBED_BACKENDS)}"
         )
     embedder = _EMBEDDER_SINGLETONS.get(backend_key)
     if embedder is None:
         kwargs: Dict[str, Any] = {"cache_dir": _model_cache_dir(backend_key)}
-        if backend_key == "esm" and max_length is not None:
-            kwargs["max_len"] = int(max_length)
-        embedder_cls = EMBEDDER_FACTORIES[backend_key]
+        if backend_key == "esm":
+            from utils.esm_embed import ESM_Embed  # local import avoids optional dependency
+
+            embedder_cls = ESM_Embed
+        else:
+            embedder_cls = ProstEmbed
         embedder = embedder_cls(**kwargs)
         _EMBEDDER_SINGLETONS[backend_key] = embedder
     return embedder
+
+
+def _get_prostt5_3di_embedder(prost_cfg: Mapping[str, Any]) -> ProstT53DiEmbedder:
+    global _PROST3DI_SINGLETON
+    skip_second_fwd = bool(prost_cfg.get("skip_second_fwd", False))
+    if _PROST3DI_SINGLETON is None:
+        model_name = str(prost_cfg.get("model_name", "Rostlab/ProstT5"))
+        cache_dir = prost_cfg.get("cache_dir")
+        embedder = ProstT53DiEmbedder(
+            model_name=model_name,
+            device=prost_cfg.get("device", "cpu"),
+            cache_dir=cache_dir or _model_cache_dir("prostt5_3di"),
+            prefix_token=str(prost_cfg.get("prefix_token", "<AA2fold>")),
+            three_di_tokens=prost_cfg.get("three_di_tokens"),
+            three_di_token_ids=prost_cfg.get("three_di_token_ids"),
+            skip_second_fwd=skip_second_fwd,
+        )
+        _PROST3DI_SINGLETON = embedder
+        log.info(
+            "Initialized ProstT5 3Di embedder (model=%s, device=%s, skip_second_fwd=%s).",
+            model_name,
+            prost_cfg.get("device", "cpu"),
+            skip_second_fwd,
+        )
+    else:
+        _PROST3DI_SINGLETON.skip_second_fwd = skip_second_fwd
+    return _PROST3DI_SINGLETON
 
 
 def _ensure_cached_embedding(
     entry_id: str,
     sequence: str,
     *,
-    max_length: Optional[int],
     backend: str,
 ) -> tuple[Path, int, int]:
     metadata = _ensure_embeddings_for_entries(
         [(entry_id, sequence)],
-        max_length=max_length,
         backend=backend,
         batch_size=1,
     )
@@ -181,7 +235,6 @@ def _ensure_cached_embedding(
 def _ensure_embeddings_for_entries(
     entries: Sequence[tuple[str, str]],
     *,
-    max_length: Optional[int],
     backend: str,
     batch_size: int = EMBED_BATCH_SIZE,
 ) -> Dict[str, tuple[Path, int, int]]:
@@ -208,10 +261,14 @@ def _ensure_embeddings_for_entries(
             continue
         pending.append((entry_id, sequence, cache_path))
 
+    if entries:
+        cached = len(entries) - len(pending)
+        log.info("Embedding cache (%s): %d cached, %d pending.", backend, cached, len(pending))
+
     if not pending:
         return meta
 
-    embedder = _get_seq_embedder(max_length, backend)
+    embedder = _get_seq_embedder(backend)
     chunk_size = max(1, batch_size)
     for start in range(0, len(pending), chunk_size):
         chunk = pending[start : start + chunk_size]
@@ -224,6 +281,126 @@ def _ensure_embeddings_for_entries(
             array = masked.numpy()
             length, dim = _write_embedding_cache(cache_path, array)
             meta[entry_id] = (cache_path, length, dim)
+
+    return meta
+
+
+def _resolve_structure_npz_dir(
+    data_cfg: Mapping[str, Any],
+    cache_root: Path,
+    structure_cfg: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    struct_cfg = dict(structure_cfg or {})
+    path_value = (
+        struct_cfg.get("graph_cache_dir")
+        or struct_cfg.get("graph_npz_dir")
+        or struct_cfg.get("npz_dir")
+    )
+    if path_value:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = (cache_root / path).resolve()
+        return path.resolve()
+    path_value = data_cfg.get("structure_npz_dir")
+    if path_value:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = (cache_root / path).resolve()
+        return path.resolve()
+    graph_source = str(struct_cfg.get("graph_source", "esmfold")).lower()
+    if graph_source.startswith("esm2") or "contact" in graph_source:
+        return (cache_root / "esm2_contact_cache").resolve()
+    if "alphafold" in graph_source or graph_source.startswith("af"):
+        return (cache_root / "af_graphs").resolve()
+    return (cache_root / "esmfold_cache").resolve()
+
+
+def _ensure_precomputed_structures_for_entries(
+    entries: Sequence[tuple[str, str]],
+    *,
+    structure_dir: Path,
+) -> Dict[str, tuple[Path, int]]:
+    """Resolve cached ESMFold graphs from a precomputed directory."""
+
+    meta: Dict[str, tuple[Path, int]] = {}
+    missing: list[str] = []
+    for entry_id, _sequence in entries:
+        cache_path = _entry_cache_path(entry_id, structure_dir, mkdir=False)
+        if not cache_path.exists():
+            missing.append(entry_id)
+            continue
+        archive = np.load(cache_path, allow_pickle=False, mmap_mode="r")
+        try:
+            for key in ("edge_index", "edge_weight", "plddt"):
+                if key not in archive:
+                    raise KeyError(f"Key '{key}' missing from {cache_path.name}")
+            shape = archive["plddt"].shape
+        finally:
+            archive.close()
+        meta[entry_id] = (cache_path, int(shape[0]))
+
+    if missing:
+        sample = ", ".join(missing[:5])
+        log.error("Missing %d precomputed structure graphs.", len(missing))
+        raise FileNotFoundError(
+            "Missing precomputed structure graphs for entries "
+            f"(showing up to 5): {sample}. "
+            "Run scripts/precompute_alphafold_graphs.py, scripts/precompute_esmfold_graphs.py, "
+            "or scripts/precompute_esm2_contact_graphs.py to generate sparse graph caches."
+        )
+
+    return meta
+
+
+def _ensure_prostt5_probs_for_entries(
+    entries: Sequence[tuple[str, str]],
+    *,
+    prost_cfg: Mapping[str, Any],
+    batch_size: int = EMBED_BATCH_SIZE,
+) -> Dict[str, tuple[Path, int]]:
+    """Ensure cached ProstT5 encoder embeddings exist for provided entries."""
+
+    meta: Dict[str, tuple[Path, int]] = {}
+    pending: list[tuple[str, str, Path]] = []
+    for entry_id, sequence in entries:
+        cache_path = _embedding_cache_path(entry_id, "prostt5_3di")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            shape = _read_npz_shape(cache_path, key="embeddings")
+            meta[entry_id] = (cache_path, int(shape[0]))
+            continue
+        pending.append((entry_id, sequence, cache_path))
+
+    if entries:
+        cached = len(entries) - len(pending)
+        log.info("ProstT5 3Di cache: %d cached, %d pending.", cached, len(pending))
+
+    if not pending:
+        return meta
+
+    embedder = _get_prostt5_3di_embedder(prost_cfg)
+    log.info("Generating ProstT5 encoder embeddings.")
+    chunk_size = max(1, batch_size)
+    for start in range(0, len(pending), chunk_size):
+        chunk = pending[start : start + chunk_size]
+        sequences = [seq for _entry_id, seq, _cache in chunk]
+        embeddings, lengths_tensor = embedder(sequences)
+        for idx, (entry_id, seq, cache_path) in enumerate(chunk):
+            expected_len = len(seq)
+            observed_len = int(lengths_tensor[idx].item())
+            if observed_len != expected_len:
+                raise ValueError(
+                    f"ProstT5 length mismatch for {entry_id}: "
+                    f"expected {expected_len}, got {observed_len}"
+                )
+            embed_np = embeddings[idx, :expected_len].numpy()
+            if embed_np.shape[0] != expected_len:
+                raise ValueError(
+                    f"ProstT5 length mismatch for {entry_id}: "
+                    f"expected {expected_len}, got {embed_np.shape[0]}"
+                )
+            _write_npz_cache(cache_path, "embeddings", embed_np)
+            meta[entry_id] = (cache_path, embed_np.shape[0])
 
     return meta
 
@@ -379,9 +556,10 @@ def prepare_manifests(
     output_root: Path,
     aspect: str,
     feature_dim: int,
-    max_length: Optional[int] = None,
     protein_prior_cfg: Optional[Mapping[str, Any]] = None,
     embedding_backend: str = "esm",
+    structure_cfg: Optional[Mapping[str, Any]] = None,
+    prostt5_cfg: Optional[Mapping[str, Any]] = None,
     cache_root: Optional[Path | str] = None,
 ) -> ManifestBundle:
     set_cache_root(cache_root)
@@ -490,13 +668,44 @@ def prepare_manifests(
 
     embedding_meta = _ensure_embeddings_for_entries(
         ordered_entries,
-        max_length=max_length,
         backend=backend,
     )
 
+    lengths_by_id = {entry_id: len(sequence) for entry_id, sequence in ordered_entries}
+
+    structure_meta: Dict[str, tuple[Path, int]] = {}
+    structure_cfg = dict(structure_cfg or {})
+    structure_dir: Optional[Path] = None
+    if structure_cfg.get("enabled", False):
+        structure_dir = _resolve_structure_npz_dir(data_cfg, CACHE_ROOT, structure_cfg)
+        if not structure_dir.exists():
+            raise FileNotFoundError(
+                f"Structure graph cache not found at {structure_dir}. "
+                "Run scripts/precompute_esmfold_graphs.py or scripts/precompute_esm2_contact_graphs.py "
+                "to generate sparse graph caches."
+            )
+        structure_meta = _ensure_precomputed_structures_for_entries(
+            ordered_entries,
+            structure_dir=structure_dir,
+        )
+
+    prost_meta: Dict[str, tuple[Path, int]] = {}
+    prostt5_cfg = dict(prostt5_cfg or {})
+    if prostt5_cfg.get("enabled", False):
+        prost_meta = _ensure_prostt5_probs_for_entries(
+            ordered_entries,
+            prost_cfg=prostt5_cfg,
+        )
+
     embedding_width: Optional[int] = None
     for entry_id, _sequence in ordered_entries:
-        cache_path, _, dim = embedding_meta[entry_id]
+        cache_path, length_val, dim = embedding_meta[entry_id]
+        expected_len = lengths_by_id[entry_id]
+        if length_val != expected_len:
+            raise ValueError(
+                f"Embedding length mismatch for {entry_id}: "
+                f"sequence length {expected_len}, embedding length {length_val}"
+            )
         if embedding_width is None:
             embedding_width = dim
         elif embedding_width != dim:
@@ -508,9 +717,26 @@ def prepare_manifests(
         record_templates[entry_id] = {
             "entry_id": entry_id,
             "embedding_path": cache_path,
+            "lengths": [int(expected_len)],
             "targets": targets,
             "labels": targets,
         }
+        if entry_id in structure_meta:
+            struct_path, struct_len = structure_meta[entry_id]
+            if struct_len != int(expected_len):
+                raise ValueError(
+                    f"Structure graph length mismatch for {entry_id}: "
+                    f"sequence length {expected_len}, structure length {struct_len}"
+                )
+            record_templates[entry_id]["structure_path"] = struct_path
+        if entry_id in prost_meta:
+            prost_path, prost_len = prost_meta[entry_id]
+            if prost_len != int(expected_len):
+                raise ValueError(
+                    f"ProstT5 length mismatch for {entry_id}: "
+                    f"sequence length {expected_len}, prost length {prost_len}"
+                )
+            record_templates[entry_id]["prostt5_path"] = prost_path
 
     if not record_templates:
         raise RuntimeError("No records were generated while building manifests")
@@ -528,12 +754,43 @@ def prepare_manifests(
 
     meta_template = {
         "feature_dim": embedding_width,
-        "max_length": max_length,
         "num_functions": num_functions,
         "terms": selected_terms,
         "aspect": aspect,
         "embedding_backend": backend,
     }
+    if structure_cfg.get("enabled", False):
+        graph_meta: Dict[str, Any] = {
+            "graph_source": structure_cfg.get("graph_source", "esmfold"),
+            "npz_dir": str(structure_dir) if structure_dir is not None else None,
+            "format": "sparse",
+            "edge_index_key": "edge_index",
+            "edge_weight_key": "edge_weight",
+            "plddt_key": "plddt",
+        }
+        if "distance_cutoff" in structure_cfg:
+            graph_meta["distance_cutoff"] = structure_cfg.get("distance_cutoff")
+        if "top_k" in structure_cfg:
+            graph_meta["top_k"] = structure_cfg.get("top_k")
+        if "model_name" in structure_cfg:
+            graph_meta["model_name"] = structure_cfg.get("model_name")
+        if "contact_top_k" in structure_cfg:
+            graph_meta["contact_top_k"] = structure_cfg.get("contact_top_k")
+        if "contact_min_prob" in structure_cfg:
+            graph_meta["contact_min_prob"] = structure_cfg.get("contact_min_prob")
+        if "contact_band" in structure_cfg:
+            graph_meta["contact_band"] = structure_cfg.get("contact_band")
+        if "contact_symmetrize" in structure_cfg:
+            graph_meta["contact_symmetrize"] = structure_cfg.get("contact_symmetrize")
+        if "contact_mutual" in structure_cfg:
+            graph_meta["contact_mutual"] = structure_cfg.get("contact_mutual")
+        meta_template["structure_graph"] = graph_meta
+    if prostt5_cfg.get("enabled", False):
+        meta_template["prostt5_3di"] = {
+            "model_name": prostt5_cfg.get("model_name", "Rostlab/ProstT5"),
+            "three_di_tokens": prostt5_cfg.get("three_di_tokens"),
+            "three_di_token_ids": prostt5_cfg.get("three_di_token_ids"),
+        }
 
     bundle_paths: Dict[str, Path] = {}
     for split, ids in split_assignments.items():
@@ -550,30 +807,44 @@ def prepare_manifests(
                 continue
             manifest_ids.append(template["entry_id"])
             rel_embed = os.path.relpath(template["embedding_path"], split_dir)
-            records.append(
-                {
-                    "entry_id": template["entry_id"],
-                    "embedding_path": rel_embed.replace(os.sep, "/"),
-                    "targets": template["targets"],
-                    "labels": template.get("labels", template["targets"]),
-                    "go_prior_path": rel_go_prior,
-                }
-            )
+            record = {
+                "entry_id": template["entry_id"],
+                "embedding_path": rel_embed.replace(os.sep, "/"),
+                "targets": template["targets"],
+                "labels": template.get("labels", template["targets"]),
+                "go_prior_path": rel_go_prior,
+            }
+            if "lengths" in template:
+                record["lengths"] = template["lengths"]
+            if "structure_path" in template:
+                rel_struct = os.path.relpath(template["structure_path"], split_dir)
+                record["structure_path"] = rel_struct.replace(os.sep, "/")
+            if "prostt5_path" in template:
+                rel_prost = os.path.relpath(template["prostt5_path"], split_dir)
+                record["prostt5_path"] = rel_prost.replace(os.sep, "/")
+            records.append(record)
         if not records:
             records = []
             manifest_ids = []
             for template in record_templates.values():
                 manifest_ids.append(template["entry_id"])
                 rel_embed = os.path.relpath(template["embedding_path"], split_dir)
-                records.append(
-                    {
-                        "entry_id": template["entry_id"],
-                        "embedding_path": rel_embed.replace(os.sep, "/"),
-                        "targets": template["targets"],
-                        "labels": template.get("labels", template["targets"]),
-                        "go_prior_path": rel_go_prior,
-                    }
-                )
+                record = {
+                    "entry_id": template["entry_id"],
+                    "embedding_path": rel_embed.replace(os.sep, "/"),
+                    "targets": template["targets"],
+                    "labels": template.get("labels", template["targets"]),
+                    "go_prior_path": rel_go_prior,
+                }
+                if "lengths" in template:
+                    record["lengths"] = template["lengths"]
+                if "structure_path" in template:
+                    rel_struct = os.path.relpath(template["structure_path"], split_dir)
+                    record["structure_path"] = rel_struct.replace(os.sep, "/")
+                if "prostt5_path" in template:
+                    rel_prost = os.path.relpath(template["prostt5_path"], split_dir)
+                    record["prostt5_path"] = rel_prost.replace(os.sep, "/")
+                records.append(record)
 
         protein_prior_path: Optional[Path] = None
         if use_blast_prior and manifest_ids:
