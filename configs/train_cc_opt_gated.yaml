@@ -1,4 +1,4 @@
-# Optimized MF training config for gated_pe (best HPO trial params).
+# Optimized CC training config for gated_pe (best HPO trial params).
 
 defaults:
   - data_config: cafa_full
@@ -9,7 +9,7 @@ defaults:
   - _self_
 
 cache_path: /home/lerchen/orcd/scratch/data/esm_final/test_cache
-experiment_name: "gated_pe_mf_opt"
+experiment_name: "gated_pe_cc_opt"
 
 training:
   devices: 1
@@ -25,17 +25,17 @@ training:
 
 optimizer:
   name: adamw
-  lr: 6.24564612705163e-05
-  weight_decay: 0.006089394826714454
-  betas: [0.9, 0.999]
+  lr: 2.50994707224806e-05
+  weight_decay: 2.31782629719761e-05
+  betas: [0.9, 0.98]
   eps: 1.0e-08
 
 scheduler:
   name: cosine
   warmup_epochs: 2
-  warmup_lr: 2.1828208204847342e-07
+  warmup_lr: 1.39459924072184e-05
   decay_epochs: 49
-  min_lr: 2.967161845658433e-05
+  min_lr: 2.48854013048017e-07
   gamma: 0.95
 
 mlflow:
@@ -64,14 +64,14 @@ model:
   prostt5_3di:
     device: cuda
   gcn:
-    dropout: 0.09727296192284733
+    dropout: 0.0802392916074203
   prost_graph:
-    dropout: 0.09727296192284733
+    dropout: 0.0802392916074203
   gated_pe:
-    mlp_dropout: 0.09727296192284733
+    mlp_dropout: 0.0802392916074203
   loss:
-    focusing: 3.9726953162373615
-    balancing: 0.30525651512239704
+    focusing: 3.11788463562921
+    balancing: 0.142837663616777
 
 evaluation:
   metric:

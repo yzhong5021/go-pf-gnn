@@ -385,11 +385,11 @@ def _build_sparse_graph(
     top_k: int,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from modules.esmfold_graph import ESMFoldGraphBuilder
+    from modules.structure_graph import StructureGraphBuilder
 
     ca_tensor = torch.from_numpy(coords).to(device=device, dtype=torch.float32)
     plddt_tensor = torch.from_numpy(plddt).to(device=device, dtype=torch.float32)
-    edge_index, edge_weight = ESMFoldGraphBuilder.build_sparse_graph_from_ca(
+    edge_index, edge_weight = StructureGraphBuilder.build_sparse_graph_from_ca(
         ca_coords=ca_tensor,
         plddt=plddt_tensor,
         distance_cutoff=distance_cutoff,

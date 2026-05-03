@@ -5,11 +5,13 @@ defaults:
   - task: pf_agcn
   - model: pf_agcn_structural
   - train@_here_: train_hpc_full
-  - hpo: optuna_search
+  - hpo: structural_optuna
   - system: hpc_supercloud
   - _self_
 
-cache_path: /home/lerchen/orcd/scratch/data/esm_final
+cache_path: /home/lerchen/orcd/scratch/data/esm_final/test_cache
+manifests_root: ${cache_path}/manifests
+top_k_bp: null
 experiment_name: "pfagcn_structural_full"
 
 training:
@@ -25,9 +27,12 @@ data_config:
   pin_memory: true
   structure_npz_dir: ${cache_path}/af_graphs
   batch_cache_dir: ${cache_path}/batch_cache
-  train_manifest: ${cache_path}/manifests/train/{aspect_lower}_manifest.json
-  val_manifest: ${cache_path}/manifests/val/{aspect_lower}_manifest.json
-  test_manifest: ${cache_path}/manifests/test/{aspect_lower}_manifest.json
+  train_manifest: ${manifests_root}/train/{aspect_lower}_manifest.json
+  val_manifest: ${manifests_root}/val/{aspect_lower}_manifest.json
+  test_manifest: ${manifests_root}/test/{aspect_lower}_manifest.json
+  go_prior:
+    top_k:
+      BP: ${top_k_bp}
 
 model:
   structural_graph:

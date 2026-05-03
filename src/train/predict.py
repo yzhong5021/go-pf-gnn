@@ -14,6 +14,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
@@ -27,6 +28,7 @@ for path in (PROJECT_ROOT, SRC_ROOT, SCRIPTS_ROOT):
 from modules.dataloader import dataframe_to_multi_hot, parse_ground_truth_table
 from utils.go_prior import Go_Prior
 import utils.go_prior as go_prior_module
+from src.model.gated_pe_model import GatedPEPFAGCN
 from src.model.structural_model import StructuralPFAGCN
 from src.train.training import compute_cafa_metrics
 import preprocessing as preprocessing_module
@@ -34,7 +36,7 @@ import preprocessing as preprocessing_module
 log = logging.getLogger(__name__)
 
 OBO_PATH = Path("/home/lerchen/code/cafa_proj/cafa6/Train/go-basic.obo")
-NOISE_FLOOR = 1e-4
+NOISE_FLOOR = 1e-2
 MAX_TERMS = 1500
 DEFAULT_THRESHOLDS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 ASPECTS = ("MF", "BP", "CC")
@@ -58,6 +60,7 @@ class PredictionDataset(Dataset):
     def __init__(self, records: Sequence[EntryRecord], require_prostt5: bool) -> None:
         self.records = list(records)
         self.require_prostt5 = bool(require_prostt5)
+        self._length_mismatch_logged = False
         if not self.records:
             raise ValueError("Prediction dataset received no records.")
 
@@ -69,11 +72,15 @@ class PredictionDataset(Dataset):
         embeddings = _load_npz_array(record.embedding_path, key="embeddings")
         if embeddings.ndim != 2:
             raise ValueError("Embeddings must have shape (length, dim).")
-        if embeddings.shape[0] != record.length:
-            raise ValueError(
-                f"Embedding length mismatch for {record.entry_id}: "
-                f"expected {record.length}, got {embeddings.shape[0]}"
+        embed_len = int(embeddings.shape[0])
+        if embed_len != record.length and not self._length_mismatch_logged:
+            log.warning(
+                "FASTA length mismatch for %s: fasta=%d embed=%d. Using cached length.",
+                record.entry_id,
+                record.length,
+                embed_len,
             )
+            self._length_mismatch_logged = True
         structure_graph = _load_structure_graph(record.structure_path)
         prostt5_probs = None
         if self.require_prostt5:
@@ -84,17 +91,17 @@ class PredictionDataset(Dataset):
             prostt5_probs = _load_npz_array(record.prostt5_path, key="embeddings")
             if prostt5_probs.ndim != 2:
                 raise ValueError("ProstT5 embeddings must have shape (length, dim).")
-            if prostt5_probs.shape[0] != record.length:
+            if prostt5_probs.shape[0] != embed_len:
                 raise ValueError(
                     f"ProstT5 length mismatch for {record.entry_id}: "
-                    f"expected {record.length}, got {prostt5_probs.shape[0]}"
+                    f"expected {embed_len}, got {prostt5_probs.shape[0]}"
                 )
         return {
             "entry_id": record.entry_id,
             "seq_embeddings": torch.from_numpy(embeddings),
             "structure_graph": structure_graph,
             "prostt5_probs": torch.from_numpy(prostt5_probs) if prostt5_probs is not None else None,
-            "length": record.length,
+            "length": embed_len,
         }
 
 
@@ -150,7 +157,15 @@ class GoOntology:
         ontology = go_prior_module._parse_obo(obo_path)
         self.parents = {term_id: list(term.parents) for term_id, term in ontology.items()}
         self.aspect = {term_id: term.aspect for term_id, term in ontology.items()}
+        self.children: Dict[str, List[str]] = {}
+        for term_id, parent_list in self.parents.items():
+            term_aspect = self.aspect.get(term_id)
+            for parent in parent_list:
+                if term_aspect is None or self.aspect.get(parent) != term_aspect:
+                    continue
+                self.children.setdefault(parent, []).append(term_id)
         self._ancestor_cache: Dict[str, List[str]] = {}
+        self._descendant_cache: Dict[str, List[str]] = {}
 
     def ancestors(self, term_id: str) -> List[str]:
         if term_id in self._ancestor_cache:
@@ -179,18 +194,66 @@ class GoOntology:
                 if score > scores.get(parent, 0.0):
                     scores[parent] = score
 
+    def descendants(self, term_id: str) -> List[str]:
+        if term_id in self._descendant_cache:
+            return self._descendant_cache[term_id]
+        visited: set[str] = set()
+        stack = list(self.children.get(term_id, []))
+        aspect = self.aspect.get(term_id)
+        while stack:
+            child = stack.pop()
+            if child in visited:
+                continue
+            if self.aspect.get(child) == aspect:
+                visited.add(child)
+            stack.extend(self.children.get(child, []))
+        descendants = sorted(visited)
+        self._descendant_cache[term_id] = descendants
+        return descendants
+
+
+def filter_parent_scores(
+    scores: Dict[str, float], ontology: GoOntology
+) -> Dict[str, float]:
+    """Drop parent terms unless they exceed the max score of any descendant."""
+
+    filtered: Dict[str, float] = {}
+    for term_id, score in scores.items():
+        descendants = ontology.descendants(term_id)
+        if not descendants:
+            filtered[term_id] = score
+            continue
+        max_desc = 0.0
+        for child in descendants:
+            child_score = scores.get(child)
+            if child_score is not None and child_score > max_desc:
+                max_desc = child_score
+        if score > max_desc:
+            filtered[term_id] = score
+    return filtered
+
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal PF-AGCN predictor")
-    parser.add_argument("--ckpt-bp", required=True, type=Path)
-    parser.add_argument("--ckpt-cc", required=True, type=Path)
-    parser.add_argument("--ckpt-mf", required=True, type=Path)
+    parser.add_argument("--ckpt-bp", type=Path, help="BP checkpoint (optional if running single-aspect)")
+    parser.add_argument("--ckpt-cc", type=Path, help="CC checkpoint (optional if running single-aspect)")
+    parser.add_argument("--ckpt-mf", type=Path, help="MF checkpoint (optional if running single-aspect)")
     parser.add_argument("--fasta", required=True, type=Path)
     parser.add_argument("--predictions-out", required=True, type=Path)
     parser.add_argument("--metrics-out", required=True, type=Path)
     parser.add_argument("--terms-tsv", type=Path, default=None)
+    parser.add_argument("--cache-path", "--cache_path", type=Path, default=None)
+    parser.add_argument("--manifests-root", "--manifests_root", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--no-propagate", action="store_true", help="Skip GO ancestor propagation")
+    parser.add_argument("--skip-metrics", action="store_true", help="Skip metric computation/output")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to predictions output and skip already-predicted entries.",
+    )
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args(argv)
 
@@ -231,12 +294,52 @@ def load_fasta_entries(path: Path) -> List[Tuple[str, str]]:
     return entries
 
 
-def resolve_cache_root() -> Path:
-    value = os.environ.get("PF_AGCN_CACHE")
-    cache_root = Path(value or "/orcd/home/002/lerchen/code/cafa_proj/data").expanduser()
+def load_predicted_entry_ids(predictions_path: Path) -> set[str]:
+    if not predictions_path.exists():
+        return set()
+    predicted: set[str] = set()
+    with predictions_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            entry_id = line.split("\t", 1)[0].strip()
+            if entry_id:
+                predicted.add(entry_id)
+    return predicted
+
+
+def ensure_trailing_newline(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if size == 0:
+        return
+    with path.open("rb+") as handle:
+        handle.seek(-1, os.SEEK_END)
+        last = handle.read(1)
+        if last not in (b"\n", b"\r"):
+            handle.write(b"\n")
+
+
+def resolve_cache_root(explicit: Optional[Path]) -> Path:
+    value = str(explicit) if explicit is not None else os.environ.get("PF_AGCN_CACHE")
+    cache_root = Path(value or "/orcd/scratch/orcd/009/lerchen/data/esm_final/test_cache/").expanduser()
     if not cache_root.is_absolute():
         cache_root = (PROJECT_ROOT / cache_root).resolve()
     return cache_root.resolve()
+
+
+def resolve_manifests_root(cache_root: Path, explicit: Optional[Path]) -> Path:
+    if explicit is None:
+        return (cache_root / "manifests").resolve()
+    path = explicit.expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+    return path.resolve()
 
 
 def resolve_structure_dir(cache_root: Path) -> Path:
@@ -411,15 +514,21 @@ def build_records(
         )
     if missing:
         sample = ", ".join(missing[:5])
-        raise FileNotFoundError(
-            "Missing cached inputs for entries (showing up to 5): "
-            f"{sample}."
+        print(
+            f"[predict] Missing cached inputs for {len(missing)} entries "
+            f"(showing up to 5): {sample}. Skipping."
         )
+    if not records:
+        raise FileNotFoundError("No cached inputs available for prediction.")
     return records
 
 
 def load_checkpoint_state(path: Path) -> Mapping[str, torch.Tensor]:
-    payload = torch.load(path, map_location="cpu")
+    # PyTorch 2.6 defaults weights_only=True; these checkpoints include metadata.
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
     if isinstance(payload, Mapping) and "state_dict" in payload:
         state = payload["state_dict"]
     else:
@@ -435,7 +544,108 @@ def load_checkpoint_state(path: Path) -> Mapping[str, torch.Tensor]:
     return cleaned
 
 
-def infer_model_config(state: Mapping[str, torch.Tensor]) -> Dict[str, object]:
+def _detect_arch_from_state(state: Mapping[str, torch.Tensor]) -> str:
+    if "stream_gate" in state or "prost_attn_pool.weight" in state or "esm_attn_pool.weight" in state:
+        return "gated_pe"
+    return "structural"
+
+
+def _infer_shared_dims(state: Mapping[str, torch.Tensor]) -> tuple[int, int, int]:
+    channels = None
+    if "sqb.dccn_norm.weight" in state:
+        channels = int(state["sqb.dccn_norm.weight"].shape[0])
+    elif "structural_gcn.norms.0.weight" in state:
+        channels = int(state["structural_gcn.norms.0.weight"].shape[0])
+    if channels is None:
+        raise ValueError("Unable to infer channel dimension from checkpoint.")
+
+    if "sqb.input_proj.weight" in state:
+        raw_dim = int(state["sqb.input_proj.weight"].shape[1])
+    else:
+        raw_dim = channels
+
+    kernel_size = 3
+    conv_key = "sqb.dccn.convs.0.weight"
+    if conv_key in state:
+        kernel_size = int(state[conv_key].shape[-1])
+
+    return channels, raw_dim, kernel_size
+
+
+def infer_model_config(state: Mapping[str, torch.Tensor], arch: str) -> Dict[str, object]:
+    channels, raw_dim, kernel_size = _infer_shared_dims(state)
+
+    if arch == "gated_pe":
+        if "mlp.6.weight" in state:
+            num_functions = int(state["mlp.6.weight"].shape[0])
+        else:
+            raise ValueError("Missing gated_pe MLP weights in checkpoint.")
+
+        prost_input_dim = 1024
+        if "prost_residue_proj.weight" in state:
+            prost_input_dim = int(state["prost_residue_proj.weight"].shape[1])
+        elif "prost_norm.weight" in state:
+            prost_input_dim = int(state["prost_norm.weight"].shape[0])
+
+        prost_graph_enabled = "prost_graph.input_proj.weight" in state
+
+        heads = 1
+        if channels % heads != 0:
+            heads = 1
+
+        return {
+            "task": {"num_functions": num_functions},
+            "model": {
+                "arch": "gated_pe",
+                "seq_embeddings": {"raw_dim": raw_dim, "feature_dim": raw_dim},
+                "sqb": {
+                    "channels": channels,
+                    "dccn": {"kernel_size": kernel_size, "dilation": 2, "dropout": 0.1},
+                },
+                "gcn": {"dropout": 0.1, "heads": heads},
+                "prostt5_3di": {"encoder_dim": prost_input_dim},
+                "prost_graph": {"enabled": prost_graph_enabled, "dropout": 0.1},
+                "gated_pe": {"mlp_dropout": 0.1},
+            },
+        }
+
+    # structural (default)
+    if "head.mlp.2.weight" not in state:
+        raise ValueError("Missing prediction head weights in checkpoint.")
+    num_functions = int(state["head.mlp.2.weight"].shape[0])
+
+    prost_enabled = any(key.startswith("prost_query.") for key in state)
+    if prost_enabled and "prost_query.pool_weights" in state:
+        heads, head_dim = state["prost_query.pool_weights"].shape
+    else:
+        heads = 4
+        if channels % heads != 0:
+            heads = 1
+        head_dim = channels // heads
+
+    prost_input_dim = 1024
+    if prost_enabled and "prost_query.projections.0.weight" in state:
+        prost_input_dim = int(state["prost_query.projections.0.weight"].shape[1])
+
+    hidden_dim = channels
+    if "head.mlp.0.weight" in state:
+        hidden_dim = int(state["head.mlp.0.weight"].shape[0])
+
+    return {
+        "task": {"num_functions": num_functions},
+        "model": {
+            "seq_embeddings": {"raw_dim": raw_dim, "feature_dim": raw_dim},
+            "sqb": {
+                "channels": channels,
+                "dccn": {"kernel_size": kernel_size, "dilation": 2, "dropout": 0.1},
+            },
+            "cross_attention": {"heads": int(heads), "dropout": 0.1},
+            "gcn": {"dropout": 0.1},
+            "prost_attention": {"enabled": prost_enabled},
+            "prostt5_3di": {"encoder_dim": prost_input_dim},
+            "prediction_head": {"mlp_hidden_dim": hidden_dim},
+        },
+    }
     channels = None
     if "sqb.dccn_norm.weight" in state:
         channels = int(state["sqb.dccn_norm.weight"].shape[0])
@@ -490,18 +700,30 @@ def infer_model_config(state: Mapping[str, torch.Tensor]) -> Dict[str, object]:
     }
 
 
-def load_model(path: Path, device: torch.device) -> StructuralPFAGCN:
+def load_model(path: Path, device: torch.device) -> nn.Module:
     state = load_checkpoint_state(path)
-    cfg = infer_model_config(state)
-    model = StructuralPFAGCN(cfg)
+    arch = _detect_arch_from_state(state)
+    cfg = infer_model_config(state, arch)
+    if arch == "gated_pe":
+        model = GatedPEPFAGCN(cfg)
+    else:
+        model = StructuralPFAGCN(cfg)
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
     return model
 
 
-def load_terms_from_prior(cache_root: Path, aspect: str) -> Optional[Tuple[List[str], np.ndarray]]:
-    prior_path = cache_root / "manifests" / "priors" / aspect.lower() / f"{aspect.lower()}_prior.npz"
+def _model_needs_prostt5(model: nn.Module) -> bool:
+    if isinstance(model, GatedPEPFAGCN):
+        return True
+    return bool(getattr(model, "prost_attention_enabled", False))
+
+
+def load_terms_from_prior(
+    manifests_root: Path, aspect: str
+) -> Optional[Tuple[List[str], np.ndarray]]:
+    prior_path = manifests_root / "priors" / aspect.lower() / f"{aspect.lower()}_prior.npz"
     if not prior_path.exists():
         return None
     with np.load(prior_path, allow_pickle=False) as archive:
@@ -644,23 +866,60 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    predictions_path = args.predictions_out
+    metrics_path = args.metrics_out
+
     fasta_path = args.fasta.resolve()
     entries = load_fasta_entries(fasta_path)
+    if args.resume:
+        predicted_entry_ids = load_predicted_entry_ids(predictions_path)
+        if predicted_entry_ids:
+            original_count = len(entries)
+            entries = [
+                (entry_id, seq)
+                for entry_id, seq in entries
+                if entry_id not in predicted_entry_ids
+            ]
+            skipped = original_count - len(entries)
+            log.info(
+                "Resume enabled: skipping %d entries already present in %s.",
+                skipped,
+                predictions_path,
+            )
+            if not entries:
+                log.info("No remaining entries to predict after resume filter.")
+                return
+        else:
+            log.info("Resume enabled but no existing predictions found at %s.", predictions_path)
+        if not args.skip_metrics:
+            log.warning(
+                "Resume enabled: metrics will only cover newly predicted entries. "
+                "Use --skip-metrics to avoid partial metrics."
+            )
     entry_ids = [entry_id for entry_id, _seq in entries]
 
-    cache_root = resolve_cache_root()
+    cache_root = resolve_cache_root(args.cache_path)
     structure_dir = resolve_structure_dir(cache_root)
+    manifests_root = resolve_manifests_root(cache_root, args.manifests_root)
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
 
-    models = {
-        "BP": load_model(args.ckpt_bp, device),
-        "CC": load_model(args.ckpt_cc, device),
-        "MF": load_model(args.ckpt_mf, device),
+    ckpt_map = {
+        "BP": args.ckpt_bp,
+        "CC": args.ckpt_cc,
+        "MF": args.ckpt_mf,
     }
+    active_ckpts = {aspect: path for aspect, path in ckpt_map.items() if path is not None}
+    if len(active_ckpts) == 0:
+        raise ValueError("Provide either all three checkpoints or exactly one checkpoint.")
+    if len(active_ckpts) == 2:
+        raise ValueError("Ambiguous checkpoint set: provide one checkpoint or all three (BP/CC/MF).")
 
-    require_prostt5 = any(model.prost_attention_enabled for model in models.values())
+    models = {aspect: load_model(path, device) for aspect, path in active_ckpts.items()}
+    active_aspects = [aspect for aspect in ASPECTS if aspect in models]
+
+    require_prostt5 = any(_model_needs_prostt5(model) for model in models.values())
     records = build_records(entries, cache_root, structure_dir, require_prostt5)
 
     batch_size = int(args.batch_size or int(os.environ.get("PF_AGCN_PRED_BATCH", "1")))
@@ -668,7 +927,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         PredictionDataset(records, require_prostt5=require_prostt5),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=int(args.num_workers),
         pin_memory=False,
         collate_fn=collate_prediction_batch,
     )
@@ -682,8 +941,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     terms_by_aspect: Dict[str, List[str]] = {}
     adjacency_by_aspect: Dict[str, np.ndarray] = {}
-    for aspect in ASPECTS:
-        prior = load_terms_from_prior(cache_root, aspect)
+    for aspect in active_aspects:
+        prior = load_terms_from_prior(manifests_root, aspect)
         if prior is not None:
             terms, adjacency = prior
         elif terms_df is not None:
@@ -703,14 +962,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 f"model outputs {num_functions}, terms list has {len(terms_by_aspect[aspect])}."
             )
 
-    parent_lookup_by_aspect = {
-        aspect: build_parent_lookup(adjacency_by_aspect[aspect]) for aspect in ASPECTS
-    }
+    if args.no_propagate:
+        parent_lookup_by_aspect = {aspect: [] for aspect in active_aspects}
+    else:
+        parent_lookup_by_aspect = {
+            aspect: build_parent_lookup(adjacency_by_aspect[aspect]) for aspect in active_aspects
+        }
 
     label_maps: Dict[str, Dict[str, torch.Tensor]] = {}
     if terms_df is not None:
         entry_set = set(entry_ids)
-        for aspect in ASPECTS:
+        for aspect in active_aspects:
             code = ASPECT_TO_CODE[aspect]
             subset = terms_df[terms_df["aspect"] == code]
             subset = subset[subset["entry_id"].isin(entry_set)]
@@ -719,23 +981,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             else:
                 label_maps[aspect] = dataframe_to_multi_hot(subset, terms_by_aspect[aspect])
     else:
-        for aspect in ASPECTS:
+        for aspect in active_aspects:
             label_maps[aspect] = {}
 
     metric_stores = {
-        aspect: ArrayStore(len(terms_by_aspect[aspect])) for aspect in ASPECTS
+        aspect: ArrayStore(len(terms_by_aspect[aspect])) for aspect in active_aspects
     }
 
     ontology = GoOntology(OBO_PATH)
 
-    predictions_path = args.predictions_out
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path = args.metrics_out
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    if not args.skip_metrics:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
-    log.info("Starting prediction for %d sequences.", len(records))
-    with predictions_path.open("w", encoding="utf-8") as pred_handle:
+    total_records = len(records)
+    log.info("Starting prediction for %d sequences.", total_records)
+    if args.resume:
+        if predictions_path.exists():
+            ensure_trailing_newline(predictions_path)
+        pred_mode = "a"
+    else:
+        pred_mode = "w"
+    with predictions_path.open(pred_mode, encoding="utf-8") as pred_handle:
         with torch.no_grad():
+            processed = 0
             for batch in dataloader:
                 entry_batch = batch["entry_ids"]
                 batch = move_to_device(batch, device)
@@ -747,7 +1016,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
                 probs_by_aspect: Dict[str, np.ndarray] = {}
                 for aspect, model in models.items():
-                    if model.prost_attention_enabled:
+                    if isinstance(model, GatedPEPFAGCN):
+                        output = model(
+                            seq_embeddings=seq_embeddings,
+                            structure_graph=structure_graph,
+                            prostt5_probs=prostt5_probs,
+                            lengths=lengths,
+                            mask=mask,
+                        )
+                    elif model.prost_attention_enabled:
                         output = model(
                             seq_embeddings=seq_embeddings,
                             structure_graph=structure_graph,
@@ -766,9 +1043,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     probs = torch.sigmoid(logits).cpu().numpy()
                     probs_by_aspect[aspect] = probs
 
-                for aspect, probs in probs_by_aspect.items():
-                    parent_lookup = parent_lookup_by_aspect[aspect]
-                    probs_by_aspect[aspect] = propagate_scores_matrix(probs, parent_lookup)
+                if not args.no_propagate:
+                    for aspect, probs in probs_by_aspect.items():
+                        parent_lookup = parent_lookup_by_aspect[aspect]
+                        probs_by_aspect[aspect] = propagate_scores_matrix(probs, parent_lookup)
 
                 for aspect, probs in probs_by_aspect.items():
                     targets = build_targets_for_batch(
@@ -776,12 +1054,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         label_maps.get(aspect, {}),
                         len(terms_by_aspect[aspect]),
                     )
-                    targets = propagate_targets_matrix(targets, parent_lookup_by_aspect[aspect])
+                    if not args.no_propagate:
+                        targets = propagate_targets_matrix(targets, parent_lookup_by_aspect[aspect])
                     metric_stores[aspect].append(probs, targets)
 
                 for row_idx, entry_id in enumerate(entry_batch):
                     combined_scores: Dict[str, float] = {}
-                    for aspect in ASPECTS:
+                    for aspect in active_aspects:
                         probs = probs_by_aspect[aspect][row_idx]
                         terms = terms_by_aspect[aspect]
                         keep = np.flatnonzero(probs >= NOISE_FLOOR)
@@ -791,31 +1070,38 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             if score > combined_scores.get(term_id, 0.0):
                                 combined_scores[term_id] = min(score, 1.0)
 
-                    ontology.propagate_scores(combined_scores)
+                    if not args.no_propagate:
+                        ontology.propagate_scores(combined_scores)
+                    else:
+                        combined_scores = filter_parent_scores(combined_scores, ontology)
                     selected = select_top_predictions(combined_scores)
                     for term_id, score in selected:
                         formatted = format_score(score)
                         if formatted is None:
                             continue
                         pred_handle.write(f"{entry_id}\t{term_id}\t{formatted}\n")
+                processed += len(entry_batch)
+                if processed % 1000 == 0 or processed >= total_records:
+                    log.info("Predicted %d/%d sequences.", processed, total_records)
 
-    metrics_rows: Dict[str, Dict[str, float]] = {}
-    for aspect in ASPECTS:
-        probs, targets = metric_stores[aspect].materialize()
-        metrics = compute_cafa_metrics(probs, targets, DEFAULT_THRESHOLDS, ia_weights=None)
-        metrics_rows[aspect] = metrics
-        metric_stores[aspect].cleanup()
+    if not args.skip_metrics:
+        metrics_rows: Dict[str, Dict[str, float]] = {}
+        for aspect in active_aspects:
+            probs, targets = metric_stores[aspect].materialize()
+            metrics = compute_cafa_metrics(probs, targets, DEFAULT_THRESHOLDS, ia_weights=None)
+            metrics_rows[aspect] = metrics
+            metric_stores[aspect].cleanup()
 
-    metric_keys = sorted({key for row in metrics_rows.values() for key in row.keys()})
-    with metrics_path.open("w", encoding="utf-8", newline="") as handle:
-        handle.write("aspect\t" + "\t".join(metric_keys) + "\n")
-        for aspect in ASPECTS:
-            row = metrics_rows.get(aspect, {})
-            values = [str(row.get(key, "")) for key in metric_keys]
-            handle.write(aspect + "\t" + "\t".join(values) + "\n")
+        metric_keys = sorted({key for row in metrics_rows.values() for key in row.keys()})
+        with metrics_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("aspect\t" + "\t".join(metric_keys) + "\n")
+            for aspect in active_aspects:
+                row = metrics_rows.get(aspect, {})
+                values = [str(row.get(key, "")) for key in metric_keys]
+                handle.write(aspect + "\t" + "\t".join(values) + "\n")
+        log.info("Wrote metrics to %s", metrics_path)
 
     log.info("Wrote predictions to %s", predictions_path)
-    log.info("Wrote metrics to %s", metrics_path)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # @package _global_
-# Optuna HPO settings for gated_pe sweeps.
+# Optuna HPO settings for attn_pe structural sweeps.
 
 defaults:
   - _self_
@@ -58,7 +58,19 @@ hpo:
     - name: optimizer.eps
       type: categorical
       choices: [1.0e-08, 1.0e-06]
-    - name: model.dropout
+    - name: model.gcn.dropout
+      type: float
+      low: 0.0
+      high: 0.3
+    - name: model.sqb.dccn.dropout
+      type: float
+      low: 0.0
+      high: 0.3
+    - name: model.prost_graph.dropout
+      type: float
+      low: 0.0
+      high: 0.3
+    - name: model.cross_attention.dropout
       type: float
       low: 0.0
       high: 0.3

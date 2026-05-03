@@ -1,4 +1,4 @@
-"""Optuna HPO runner for gated_pe with MLflow + Lightning."""
+"""Optuna HPO runner for attn_pe structural model with MLflow + Lightning."""
 
 from __future__ import annotations
 
@@ -136,6 +136,14 @@ class HPOPFAGCNLightningModule(PFAGCNLightningModule):
                 "frequency": 1,
             },
         }
+
+
+def _set_mlflow_run_name(cfg: DictConfig, run_name: str) -> None:
+    with read_write(cfg):
+        with open_dict(cfg):
+            if cfg.get("mlflow") is None:
+                cfg.mlflow = {}
+            cfg.mlflow.run_name_override = run_name
 
 
 def build_hpo_scheduler(cfg: DictConfig, optimizer: torch.optim.Optimizer) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
@@ -339,12 +347,14 @@ def _apply_trial_params(cfg: DictConfig, params: Mapping[str, Any]) -> None:
                 cfg.scheduler.warmup_lr = float(params["scheduler.warmup_lr"])
             if "scheduler.min_lr" in params:
                 cfg.scheduler.min_lr = float(params["scheduler.min_lr"])
-            if "model.dropout" in params:
-                dropout = float(params["model.dropout"])
-                cfg.model.gcn.dropout = dropout
-                cfg.model.prost_graph.dropout = dropout
-                cfg.model.gated_pe.mlp_dropout = dropout
-                cfg.model.sqb.dccn.dropout = dropout
+            if "model.gcn.dropout" in params:
+                cfg.model.gcn.dropout = float(params["model.gcn.dropout"])
+            if "model.sqb.dccn.dropout" in params:
+                cfg.model.sqb.dccn.dropout = float(params["model.sqb.dccn.dropout"])
+            if "model.prost_graph.dropout" in params and hasattr(cfg.model, "prost_graph"):
+                cfg.model.prost_graph.dropout = float(params["model.prost_graph.dropout"])
+            if "model.cross_attention.dropout" in params and hasattr(cfg.model, "cross_attention"):
+                cfg.model.cross_attention.dropout = float(params["model.cross_attention.dropout"])
             if "model.loss.focusing" in params:
                 cfg.model.loss.focusing = float(params["model.loss.focusing"])
             if "model.loss.balancing" in params:
@@ -662,9 +672,7 @@ def _run_multi_seed(
             with read_write(cfg):
                 with open_dict(cfg):
                     cfg.training.seed = int(seed)
-                    cfg.mlflow.run_name_override = (
-                        f"gated_pe_hpo_seed{seed}_trial{trial.number:04d}"
-                    )
+            _set_mlflow_run_name(cfg, f"attn_hpo_seed{seed}_trial{trial.number:04d}")
             seed_dir = trial_dir / f"seed_{seed:02d}"
             seed_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -710,9 +718,7 @@ def _trial_objective(
 
     _apply_trial_params(cfg, params)
 
-    with read_write(cfg):
-        with open_dict(cfg):
-            cfg.mlflow.run_name_override = f"gated_pe_hpo_trial{trial.number:04d}_w{worker_id}"
+    _set_mlflow_run_name(cfg, f"attn_hpo_trial{trial.number:04d}_w{worker_id}")
 
     run_dir = _trial_dir(study_dir, trial.number)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -752,9 +758,9 @@ def _should_stop(
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optuna HPO runner for gated_pe")
+    parser = argparse.ArgumentParser(description="Optuna HPO runner for attn_pe structural model")
     parser.add_argument("--config-path", type=str, default="configs")
-    parser.add_argument("--config-name", type=str, default="gated_pe_hpo")
+    parser.add_argument("--config-name", type=str, default="structural_config_full")
     parser.add_argument(
         "--aspect",
         type=str,
@@ -827,7 +833,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     results_root = Path(cfg.system.paths.results_root)
-    study_dir = results_root / "hpo_gated_pe" / aspect_upper.lower() / study.study_name
+    study_dir = results_root / "attn_hpo" / aspect_upper.lower() / study.study_name
     study_dir.mkdir(parents=True, exist_ok=True)
 
     if args.finalize_only:

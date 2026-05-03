@@ -11,8 +11,8 @@ sources:
 split:
   seed: 1337
   ratios:
-    train: 0.8
-    val: 0.2
+    train: 1.0
+    val: 0.0
     test: 0.0
 
 train_csv: null
